@@ -37,7 +37,7 @@ import os
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 
 import aiofiles
@@ -128,7 +128,9 @@ class ChatEvent(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     conversation_id: str
     seq: int | None = None  # Auto-assigned by repository
-    timestamp: datetime = Field(default_factory=datetime.now)
+    timestamp: datetime = Field(
+        default_factory=lambda: datetime.now(UTC)
+    )
 
     # Event classification
     type: Literal[
