@@ -17,21 +17,18 @@ from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any
 
 from mcp import types
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from src.history.chat_store import ChatEvent, ChatRepository, Usage
+from src.config import Configuration
+from src.history.chat_store import ChatEvent, Usage
 from src.history.conversation_utils import build_conversation_with_token_limit
 
 if TYPE_CHECKING:
-    from src.main import LLMClient, MCPClient
     from src.tool_schema_manager import ToolSchemaManager
 else:
     from src.tool_schema_manager import ToolSchemaManager
 
 logger = logging.getLogger(__name__)
-
-# Maximum number of tool call hops to prevent infinite recursion
-MAX_TOOL_HOPS = 8
 
 
 class ToolCallContext(BaseModel):
@@ -63,20 +60,27 @@ class ChatService:
     4. Sends you back the response
     """
 
+    class ChatServiceConfig(BaseModel):
+        model_config = ConfigDict(arbitrary_types_allowed=True)
+
+        clients: list[Any]  # MCPClient
+        llm_client: Any  # LLMClient
+        config: dict[str, Any]
+        repo: Any  # ChatRepository
+        configuration: Configuration
+        ctx_window: int = 4000
+
     def __init__(
         self,
-        clients: list[MCPClient],
-        llm_client: LLMClient,
-        config: dict[str, Any],
-        repo: ChatRepository,
-        ctx_window: int = 4000,
+        service_config: ChatServiceConfig,
     ):
-        self.clients = clients
-        self.llm_client = llm_client
-        self.config = config
-        self.repo = repo
-        self.ctx_window = ctx_window
-        self.chat_conf = config.get("chat", {}).get("service", {})
+        self.clients = service_config.clients
+        self.llm_client = service_config.llm_client
+        self.config = service_config.config
+        self.repo = service_config.repo
+        self.configuration = service_config.configuration
+        self.ctx_window = service_config.ctx_window
+        self.chat_conf = self.config.get("chat", {}).get("service", {})
         self.tool_mgr: ToolSchemaManager | None = None
         self._init_lock = asyncio.Lock()
         self._ready = asyncio.Event()
@@ -403,12 +407,13 @@ class ChatService:
         hops = 0
 
         while context.assistant_msg.get("tool_calls"):
-            if hops >= MAX_TOOL_HOPS:
+            max_tool_hops = self.configuration.get_max_tool_hops()
+            if hops >= max_tool_hops:
                 warning_msg = (
-                    f"⚠️ Reached maximum tool call limit ({MAX_TOOL_HOPS}). "
+                    f"⚠️ Reached maximum tool call limit ({max_tool_hops}). "
                     "Stopping to prevent infinite recursion."
                 )
-                logger.warning(f"Maximum tool hops ({MAX_TOOL_HOPS}) reached, stopping")
+                logger.warning(f"Maximum tool hops ({max_tool_hops}) reached, stopping")
                 context.full_content += "\n\n" + warning_msg
                 yield ChatMessage(
                     type="text",
@@ -846,12 +851,13 @@ class ChatService:
 
         hops = 0
         while calls := assistant_msg.get("tool_calls"):
-            if hops >= MAX_TOOL_HOPS:
+            max_tool_hops = self.configuration.get_max_tool_hops()
+            if hops >= max_tool_hops:
                 logger.warning(
-                    f"Maximum tool hops ({MAX_TOOL_HOPS}) reached, stopping recursion"
+                    f"Maximum tool hops ({max_tool_hops}) reached, stopping recursion"
                 )
                 assistant_full_text += (
-                    f"\n\n⚠️ Reached maximum tool call limit ({MAX_TOOL_HOPS}). "
+                    f"\n\n⚠️ Reached maximum tool call limit ({max_tool_hops}). "
                     "Stopping to prevent infinite recursion."
                 )
                 break

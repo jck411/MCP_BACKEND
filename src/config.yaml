@@ -28,6 +28,9 @@ chat:
     streaming:
       enabled: true  # Enable streaming by default (required setting)
 
+    # Tool execution configuration
+    max_tool_hops: 8  # Maximum number of recursive tool calls to prevent infinite loops
+
     # Tool execution notifications
     tool_notifications:
       enabled: true

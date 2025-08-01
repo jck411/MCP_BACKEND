@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
 
 from src.chat_service import ChatService
+from src.config import Configuration
 from src.history.chat_store import ChatRepository
 
 # TYPE_CHECKING imports to avoid circular imports
@@ -65,10 +66,19 @@ class WebSocketServer:
         llm_client: "LLMClient",
         config: dict[str, Any],
         repo: ChatRepository,
+        configuration: Configuration,
     ):
-        self.chat_service = ChatService(clients, llm_client, config, repo=repo)
+        service_config = ChatService.ChatServiceConfig(
+            clients=clients,
+            llm_client=llm_client,
+            config=config,
+            repo=repo,
+            configuration=configuration,
+        )
+        self.chat_service = ChatService(service_config)
         self.repo = repo
         self.config = config
+        self.configuration = configuration
         self.app = self._create_app()
         self.active_connections: list[WebSocket] = []
         # Store conversation id per socket
@@ -102,38 +112,7 @@ class WebSocketServer:
         return app
 
     async def _handle_websocket_connection(self, websocket: WebSocket):
-        """
-        Handle the complete lifecycle of a WebSocket connection.
-
-        This internal method manages the entire WebSocket connection from acceptance
-        through message processing to cleanup. It implements a robust message loop
-        with comprehensive error handling and proper resource cleanup.
-
-        Connection Flow:
-        1. Accept and register WebSocket connection
-        2. Enter infinite message processing loop
-        3. Parse and validate incoming messages
-        4. Route messages to appropriate handlers based on action type
-        5. Handle disconnection and cleanup gracefully
-
-        Error Handling:
-        - WebSocketDisconnect: Clean disconnection (logged as info)
-        - JSON parsing errors: Send error response to client
-        - Unknown message formats: Send structured error response
-        - General exceptions: Send error response and continue if possible
-
-        The method uses Pydantic models for all message validation and response
-        formatting to ensure type safety and consistent API contracts.
-
-        Args:
-            websocket: FastAPI WebSocket connection to handle
-
-        Side Effects:
-            - Registers connection in active_connections list
-            - Creates conversation_id for the connection
-            - Processes and responds to client messages
-            - Cleans up connection on exit
-        """
+        """Handle a WebSocket connection."""
         await self._connect_websocket(websocket)
 
         try:
@@ -146,30 +125,34 @@ class WebSocketServer:
                 if message_data.get("action") == "chat":
                     await self._handle_chat_message(websocket, message_data)
                 else:
-                    # Unknown message format - use Pydantic response
+                    # Unknown message format
                     logger.warning(f"Unknown message format: {message_data}")
-                    error_response = WebSocketResponse(
-                        request_id=message_data.get("request_id", "unknown"),
-                        status="error",
-                        chunk={
-                            "error": (
-                                "Unknown message format. "
-                                "Expected 'action': 'chat'"
-                            )
-                        }
+                    await websocket.send_text(
+                        json.dumps(
+                            {
+                                "status": "error",
+                                "chunk": {
+                                    "error": (
+                                        "Unknown message format. "
+                                        "Expected 'action': 'chat'"
+                                    )
+                                },
+                            }
+                        )
                     )
-                    await websocket.send_text(error_response.model_dump_json())
 
         except WebSocketDisconnect:
             logger.info("WebSocket disconnected")
         except Exception as e:
             logger.error(f"WebSocket error: {e}")
-            error_response = WebSocketResponse(
-                request_id="unknown",
-                status="error",
-                chunk={"error": f"Server error: {e!s}"}
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "chunk": {"error": f"Server error: {e!s}"},
+                    }
+                )
             )
-            await websocket.send_text(error_response.model_dump_json())
         finally:
             self._disconnect_websocket(websocket)
 
@@ -249,28 +232,7 @@ class WebSocketServer:
     async def _send_error_response(
         self, websocket: WebSocket, request_id: str, error_message: str
     ):
-        """
-        Send standardized error response to WebSocket client.
-
-        This internal helper method provides a consistent way to communicate errors
-        back to WebSocket clients. It ensures all error responses follow the same
-        format and use proper Pydantic model validation.
-
-        The method is used throughout the WebSocket server for various error
-        conditions:
-        - Message validation failures
-        - Configuration errors
-        - Processing exceptions
-        - Service unavailable conditions
-
-        Args:
-            websocket: WebSocket connection to send error to
-            request_id: Request identifier for error correlation
-            error_message: Human-readable error description
-
-        Side Effects:
-            Sends JSON-formatted error response through WebSocket connection
-        """
+        """Send error response using Pydantic model."""
         response = WebSocketResponse(
             request_id=request_id,
             status="error",
@@ -292,13 +254,16 @@ class WebSocketServer:
         ):
             await self._send_chat_response(websocket, request_id, chat_message)
 
-        # Send completion signal using Pydantic
-        completion_response = WebSocketResponse(
-            request_id=request_id,
-            status="complete",
-            chunk={}
+        # Send completion signal
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "status": "complete",
+                    "chunk": {},
+                }
+            )
         )
-        await websocket.send_text(completion_response.model_dump_json())
 
     async def _handle_non_streaming_chat(
         self,
@@ -314,73 +279,86 @@ class WebSocketServer:
             request_id=request_id,
         )
 
-        # Send final response using Pydantic
-        final_response = WebSocketResponse(
-            request_id=request_id,
-            status="chunk",
-            chunk={
-                "type": "text",
-                "data": assistant_ev.content,
-                "metadata": {},
-            }
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "status": "chunk",
+                    "chunk": {
+                        "type": "text",
+                        "data": assistant_ev.content,
+                        "metadata": {},
+                    },
+                }
+            )
         )
-        await websocket.send_text(final_response.model_dump_json())
 
-        # Send completion signal using Pydantic
-        completion_response = WebSocketResponse(
-            request_id=request_id,
-            status="complete",
-            chunk={}
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "status": "complete",
+                    "chunk": {},
+                }
+            )
         )
-        await websocket.send_text(completion_response.model_dump_json())
 
     async def _send_chat_response(
         self, websocket: WebSocket, request_id: str, chat_message
     ):
-        """Send a chat response to the frontend using Pydantic models."""
+        """Send a chat response to the frontend."""
         logger.info(
             "Sending WebSocket message: "
             f"type={chat_message.type}, "
             f"content={chat_message.content[:50]}..."
         )
 
-        # Convert chat service message to frontend format using Pydantic
+        # Convert chat service message to frontend format
         if chat_message.type == "text":
             # Only send text messages that aren't tool results
             if not chat_message.metadata.get("tool_result"):
-                response = WebSocketResponse(
-                    request_id=request_id,
-                    status="chunk",
-                    chunk={
-                        "type": "text",
-                        "data": chat_message.content,
-                        "metadata": chat_message.metadata,
-                    }
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "request_id": request_id,
+                            "status": "chunk",
+                            "chunk": {
+                                "type": "text",
+                                "data": chat_message.content,
+                                "metadata": chat_message.metadata,
+                            },
+                        }
+                    )
                 )
-                await websocket.send_text(response.model_dump_json())
 
         elif chat_message.type == "tool_execution":
-            response = WebSocketResponse(
-                request_id=request_id,
-                status="processing",
-                chunk={
-                    "type": "tool_execution",
-                    "data": chat_message.content,
-                    "metadata": chat_message.metadata,
-                }
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "status": "processing",
+                        "chunk": {
+                            "type": "tool_execution",
+                            "data": chat_message.content,
+                            "metadata": chat_message.metadata,
+                        },
+                    }
+                )
             )
-            await websocket.send_text(response.model_dump_json())
 
         elif chat_message.type == "error":
-            response = WebSocketResponse(
-                request_id=request_id,
-                status="error",
-                chunk={
-                    "error": chat_message.content,
-                    "metadata": chat_message.metadata,
-                }
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "status": "error",
+                        "chunk": {
+                            "error": chat_message.content,
+                            "metadata": chat_message.metadata,
+                        },
+                    }
+                )
             )
-            await websocket.send_text(response.model_dump_json())
 
     async def _connect_websocket(self, websocket: WebSocket):
         """Connect a WebSocket."""
@@ -435,6 +413,7 @@ async def run_websocket_server(
     llm_client: "LLMClient",
     config: dict[str, Any],
     repo: ChatRepository,
+    configuration: Configuration,
 ) -> None:
     """
     Run the WebSocket server.
@@ -442,5 +421,5 @@ async def run_websocket_server(
     This function maintains the same interface as before but now uses
     the clean separation between communication and business logic.
     """
-    server = WebSocketServer(clients, llm_client, config, repo)
+    server = WebSocketServer(clients, llm_client, config, repo, configuration)
     await server.start_server()

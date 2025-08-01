@@ -89,6 +89,8 @@ chat:
   service:
     streaming:
       enabled: true  # REQUIRED: true for streaming, false for complete responses
+    
+    max_tool_hops: 8  # Maximum recursive tool calls (default: 8)
 ```
 
 ### Add MCP Servers (`src/servers_config.json`)

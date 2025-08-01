@@ -19,6 +19,8 @@ from mcp import ClientSession, McpError, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from pydantic import AnyUrl
 
+import src.chat_service
+from src.chat_service import ChatService
 from src.config import Configuration
 from src.history.chat_store import JsonlRepo
 from src.websocket_server import run_websocket_server
@@ -666,8 +668,16 @@ async def main() -> None:
     # Create repository for chat history
     repo = JsonlRepo("events.jsonl")
 
+    # Now that MCPClient and LLMClient are defined, make them available
+    # in the chat_service module's namespace and rebuild ChatServiceConfig
+    src.chat_service.MCPClient = MCPClient  # type: ignore[attr-defined]
+    src.chat_service.LLMClient = LLMClient  # type: ignore[attr-defined]
+    ChatService.ChatServiceConfig.model_rebuild()
+
     async with LLMClient(llm_config, api_key) as llm_client:
-        await run_websocket_server(clients, llm_client, config.get_config_dict(), repo)
+        await run_websocket_server(
+            clients, llm_client, config.get_config_dict(), repo, config
+        )
 
 
 if __name__ == "__main__":

@@ -133,6 +133,21 @@ class Configuration:
         """
         return self._config.get("chat", {}).get("service", {})
 
+    def get_max_tool_hops(self) -> int:
+        """Get the maximum number of tool hops allowed.
+
+        Returns:
+            Maximum number of tool hops (default: 8).
+        """
+        service_config = self.get_chat_service_config()
+        max_hops = service_config.get("max_tool_hops", 8)
+
+        # Validate that it's a positive integer
+        if not isinstance(max_hops, int) or max_hops < 1:
+            raise ValueError("max_tool_hops must be a positive integer")
+
+        return max_hops
+
     def get_mcp_connection_config(self) -> dict[str, Any]:
         """Get MCP connection configuration from YAML.
 
