@@ -327,7 +327,7 @@ class ToolSchemaManager:
     async def validate_tool_parameters(
         self, tool_name: str, parameters: dict[str, Any]
     ) -> dict[str, Any]:
-        """Validate tool parameters."""
+        """Validate tool parameters with structured error reporting."""
         tool_info = self._tool_registry.get(tool_name)
         if not tool_info:
             raise McpError(
@@ -350,19 +350,37 @@ class ToolSchemaManager:
             validated = validation_model(**parameters)
             return validated.model_dump()
         except ValidationError as e:
-            error_details = []
+            # Create structured field-level errors
+            field_errors = []
             for error in e.errors():
-                error_details.append(
-                    f"{error['loc'][0] if error['loc'] else 'root'}: {error['msg']}"
+                field_path = (
+                    ".".join(str(loc) for loc in error["loc"])
+                    if error["loc"] else "root"
                 )
+                field_errors.append({
+                    "field": field_path,
+                    "message": error["msg"],
+                    "type": error["type"],
+                    "input": error.get("input"),
+                })
+
+            # Create a user-friendly summary message
+            summary_msg = f"Parameter validation failed for tool '{tool_name}'"
+            if len(field_errors) == 1:
+                first_error = field_errors[0]
+                summary_msg += f": {first_error['field']} - {first_error['message']}"
+            else:
+                summary_msg += f" ({len(field_errors)} errors)"
 
             raise McpError(
                 error=types.ErrorData(
                     code=types.INVALID_PARAMS,
-                    message=(
-                        f"Parameter validation failed for tool '{tool_name}': "
-                        f"{'; '.join(error_details)}"
-                    ),
+                    message=summary_msg,
+                    data={
+                        "tool_name": tool_name,
+                        "validation_errors": field_errors,
+                        "parameters_received": parameters,
+                    },
                 )
             ) from e
 
