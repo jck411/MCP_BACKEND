@@ -25,7 +25,7 @@ import src.chat_service
 from src.chat_service import ChatService
 from src.config import Configuration
 from src.history.chat_store import AsyncJsonlRepo
-from src.websocket_server import run_websocket_server
+from src.websocket_server import ServerConfig, run_websocket_server
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -459,13 +459,27 @@ class MCPClient:
     async def close(self) -> None:
         """Close the client connection and clean up resources."""
         async with self._cleanup_lock:
+            if not self._is_connected:
+                return  # Already closed
+
             try:
                 self._is_connected = False
-                await self.exit_stack.aclose()
-                self.session = None
+
+                # Clear session reference first
+                if self.session:
+                    self.session = None
+
+                # Close exit stack - this handles transport cleanup
+                try:
+                    await self.exit_stack.aclose()
+                except Exception as e:
+                    # Common issue with asyncio contexts in different tasks
+                    logging.debug(f"Exit stack cleanup issue for {self.name}: {e}")
+
                 logging.info(f"MCP client '{self.name}' disconnected")
             except Exception as e:
                 logging.error(f"Error during cleanup of client {self.name}: {e}")
+                # Continue cleanup even if there were errors
 
     @property
     def is_connected(self) -> bool:
@@ -646,26 +660,20 @@ class LLMClient:
         await self.close()
 
 
-def create_repository(
-    config: Configuration,
-) -> AsyncJsonlRepo:
+def create_repository() -> AsyncJsonlRepo:
     """Create repository instance based on configuration."""
-    service_config = config.get_config_dict().get("chat", {}).get("service", {})
-    repo_config = service_config.get("repository", {})
-    repo_path = repo_config.get("path", "events.jsonl")
+    # Use default configuration for repository
+    events_file = "events.jsonl"
+    fsync_enabled = True
 
-    logging.info(f"Using AsyncJsonlRepo with path: {repo_path}")
-    return AsyncJsonlRepo(repo_path)
+    logging.info(f"Using AsyncJsonlRepo with path: {events_file}")
+    return AsyncJsonlRepo(events_file, fsync_enabled=fsync_enabled)
 
 
-async def main() -> None:
-    """Main entry point - WebSocket interface with graceful shutdown handling."""
-    config = Configuration()
-
+def setup_mcp_clients(config: Configuration) -> list[MCPClient]:
+    """Create and configure MCP clients from configuration."""
     config_path = os.path.join(os.path.dirname(__file__), "servers_config.json")
     servers_config = config.load_config(config_path)
-
-    # Get MCP connection configuration
     mcp_connection_config = config.get_mcp_connection_config()
 
     clients = []
@@ -676,11 +684,33 @@ async def main() -> None:
         else:
             logging.info(f"Skipping disabled server: {name}")
 
+    return clients
+
+
+async def cleanup_mcp_clients(clients: list[MCPClient]) -> None:
+    """Perform backup cleanup of MCP clients."""
+    logging.info("Performing final cleanup of MCP clients...")
+    for client in clients:
+        try:
+            if client.is_connected:
+                await client.close()
+                logging.info(f"Closed MCP client: {client.name}")
+        except Exception as e:
+            logging.warning(f"Error closing MCP client {client.name}: {e}")
+
+
+async def main() -> None:
+    """Main entry point - WebSocket interface with graceful shutdown handling."""
+    config = Configuration()
+
+    # Setup MCP clients
+    clients = setup_mcp_clients(config)
+
     llm_config = config.get_llm_config()
     api_key = config.llm_api_key
 
     # Create repository for chat history based on configuration
-    repo = create_repository(config)
+    repo = create_repository()
 
     # Now that MCPClient and LLMClient are defined, make them available
     # in the chat_service module's namespace and rebuild ChatServiceConfig
@@ -705,11 +735,15 @@ async def main() -> None:
     async with LLMClient(llm_config, api_key) as llm_client:
         try:
             # Run server with shutdown handling
-            server_task = asyncio.create_task(
-                run_websocket_server(
-                    clients, llm_client, config.get_config_dict(), repo, config
-                )
+            server_config = ServerConfig(
+                clients=clients,
+                llm_client=llm_client,
+                config=config.get_config_dict(),
+                repo=repo,
+                configuration=config,
+                shutdown_event=shutdown_event,
             )
+            server_task = asyncio.create_task(run_websocket_server(server_config))
 
             # Wait for either server completion or shutdown signal
             done, pending = await asyncio.wait(
@@ -736,8 +770,9 @@ async def main() -> None:
             logging.error(f"Application error: {e}")
             raise
         finally:
+            # Explicitly close MCP clients created in main() as backup
+            # (ChatService should have already closed them, but this ensures cleanup)
+            await cleanup_mcp_clients(clients)
             logging.info("Application shutdown complete")
-
-
 if __name__ == "__main__":
     asyncio.run(main())

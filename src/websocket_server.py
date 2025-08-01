@@ -5,9 +5,12 @@ This module provides a thin communication layer between the frontend and chat se
 It handles WebSocket connections and message routing only.
 """
 
+import asyncio
+import contextlib
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import uvicorn
@@ -24,6 +27,17 @@ if TYPE_CHECKING:
     from src.main import LLMClient, MCPClient
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ServerConfig:
+    """Configuration for WebSocket server."""
+    clients: list["MCPClient"]
+    llm_client: "LLMClient"
+    config: dict[str, Any]
+    repo: ChatRepository
+    configuration: Configuration
+    shutdown_event: asyncio.Event | None = None
 
 
 # Pydantic models for WebSocket message validation
@@ -388,7 +402,7 @@ class WebSocketServer:
             f"{len(self.active_connections)}"
         )
 
-    async def start_server(self):
+    async def start_server(self, shutdown_event: asyncio.Event | None = None):
         """Start the WebSocket server with comprehensive cleanup."""
         # Initialize chat service
         await self.chat_service.initialize()
@@ -402,8 +416,52 @@ class WebSocketServer:
         server_config = uvicorn.Config(self.app, host=host, port=port, log_level="info")
         server = uvicorn.Server(server_config)
 
+        # Store server reference for graceful shutdown
+        self._server = server
+
         try:
-            await server.serve()
+            if shutdown_event:
+                # Run server with shutdown monitoring
+                server_task = asyncio.create_task(server.serve())
+                shutdown_task = asyncio.create_task(shutdown_event.wait())
+
+                done, pending = await asyncio.wait(
+                    [server_task, shutdown_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                # If shutdown was requested, gracefully shut down server
+                if shutdown_task in done:
+                    logger.info(
+                        "Shutdown signal received, gracefully stopping server..."
+                    )
+                    server.should_exit = True
+
+                    # Wait a brief moment for graceful shutdown
+                    try:
+                        await asyncio.wait_for(server_task, timeout=5.0)
+                    except TimeoutError:
+                        logger.warning(
+                            "Server didn't shut down gracefully within timeout"
+                        )
+                        server_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await server_task
+                else:
+                    # Server completed naturally or with error
+                    shutdown_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await shutdown_task
+
+                    # Check for server exceptions
+                    if server_task.done() and not server_task.cancelled():
+                        exception = server_task.exception()
+                        if exception is not None:
+                            raise exception
+            else:
+                # Run server normally without shutdown monitoring
+                await server.serve()
+
         except KeyboardInterrupt:
             logger.info("Received shutdown signal, cleaning up...")
         except Exception as e:
@@ -411,6 +469,11 @@ class WebSocketServer:
             raise
         finally:
             logger.info("Shutting down WebSocket server and cleaning up resources...")
+
+            # Ensure server is stopped
+            if hasattr(self, '_server') and self._server:
+                self._server.should_exit = True
+
             try:
                 await self.chat_service.cleanup()
                 logger.info("Chat service cleanup completed")
@@ -419,18 +482,18 @@ class WebSocketServer:
                 # Don't re-raise cleanup errors to avoid masking the original exception
 
 
-async def run_websocket_server(
-    clients: list["MCPClient"],
-    llm_client: "LLMClient",
-    config: dict[str, Any],
-    repo: ChatRepository,
-    configuration: Configuration,
-) -> None:
+async def run_websocket_server(server_config: ServerConfig) -> None:
     """
     Run the WebSocket server.
 
     This function maintains the same interface as before but now uses
     the clean separation between communication and business logic.
     """
-    server = WebSocketServer(clients, llm_client, config, repo, configuration)
-    await server.start_server()
+    server = WebSocketServer(
+        server_config.clients,
+        server_config.llm_client,
+        server_config.config,
+        server_config.repo,
+        server_config.configuration,
+    )
+    await server.start_server(server_config.shutdown_event)
