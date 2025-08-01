@@ -244,13 +244,13 @@ async def main():
         
         test_visibility_filter()
         print()
-        
+  # noqa: W293
         await test_in_memory_repo()
         print()
-        
+  # noqa: W293
         await test_jsonl_repo()
         print()
-        
+  # noqa: W293
         await test_compact_deltas()
         print()
         

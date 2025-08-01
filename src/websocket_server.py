@@ -102,7 +102,38 @@ class WebSocketServer:
         return app
 
     async def _handle_websocket_connection(self, websocket: WebSocket):
-        """Handle a WebSocket connection."""
+        """
+        Handle the complete lifecycle of a WebSocket connection.
+
+        This internal method manages the entire WebSocket connection from acceptance
+        through message processing to cleanup. It implements a robust message loop
+        with comprehensive error handling and proper resource cleanup.
+
+        Connection Flow:
+        1. Accept and register WebSocket connection
+        2. Enter infinite message processing loop
+        3. Parse and validate incoming messages
+        4. Route messages to appropriate handlers based on action type
+        5. Handle disconnection and cleanup gracefully
+
+        Error Handling:
+        - WebSocketDisconnect: Clean disconnection (logged as info)
+        - JSON parsing errors: Send error response to client
+        - Unknown message formats: Send structured error response
+        - General exceptions: Send error response and continue if possible
+
+        The method uses Pydantic models for all message validation and response
+        formatting to ensure type safety and consistent API contracts.
+
+        Args:
+            websocket: FastAPI WebSocket connection to handle
+
+        Side Effects:
+            - Registers connection in active_connections list
+            - Creates conversation_id for the connection
+            - Processes and responds to client messages
+            - Cleans up connection on exit
+        """
         await self._connect_websocket(websocket)
 
         try:
@@ -218,7 +249,28 @@ class WebSocketServer:
     async def _send_error_response(
         self, websocket: WebSocket, request_id: str, error_message: str
     ):
-        """Send error response using Pydantic model."""
+        """
+        Send standardized error response to WebSocket client.
+
+        This internal helper method provides a consistent way to communicate errors
+        back to WebSocket clients. It ensures all error responses follow the same
+        format and use proper Pydantic model validation.
+
+        The method is used throughout the WebSocket server for various error
+        conditions:
+        - Message validation failures
+        - Configuration errors
+        - Processing exceptions
+        - Service unavailable conditions
+
+        Args:
+            websocket: WebSocket connection to send error to
+            request_id: Request identifier for error correlation
+            error_message: Human-readable error description
+
+        Side Effects:
+            Sends JSON-formatted error response through WebSocket connection
+        """
         response = WebSocketResponse(
             request_id=request_id,
             status="error",

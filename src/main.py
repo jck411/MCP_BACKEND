@@ -44,16 +44,46 @@ class MCPClient:
         self.client_version = "0.1.0"
 
     def _resolve_command(self) -> str | None:
-        """Resolve command to executable path with generic handling."""
+        """
+        Resolve command configuration to absolute executable path with validation.
+
+        This internal method handles the complex task of finding executable commands
+        across different operating systems and environments. It supports both absolute
+        paths and commands that need to be resolved through the system PATH.
+
+        The method implements several resolution strategies:
+        1. Direct return for absolute paths (if they exist)
+        2. PATH resolution using shutil.which for relative commands
+        3. Windows-specific workaround for npx/node compatibility issues
+
+        This is critical for MCP server startup since many servers are distributed
+        as npm packages or require specific runtime environments.
+
+        Returns:
+            str | None: Absolute path to executable if found, None if resolution fails
+
+        Implementation Notes:
+            - Windows compatibility: Falls back to 'node' if 'npx' is not found
+            - Only returns paths to files that actually exist on the filesystem
+            - Does not validate that the file is executable (left to OS)
+
+        Example:
+            config = {"command": "python"}  # -> "/usr/bin/python"
+            config = {"command": "/opt/custom/tool"}  # -> "/opt/custom/tool"
+            config = {"command": "nonexistent"}  # -> None
+        """
         command = self.config.get("command")
         if not command:
             return None
 
+        # Handle absolute paths first - validate they exist
         if os.path.isabs(command):
             return command if os.path.exists(command) else None
 
+        # Resolve through system PATH
         resolved = shutil.which(command)
 
+        # Windows-specific npx compatibility workaround
         if not resolved and command == "npx" and sys.platform == "win32":
             node_path = shutil.which("node")
             if node_path:
@@ -89,7 +119,34 @@ class MCPClient:
                 self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
 
     async def _attempt_connection(self) -> None:
-        """Attempt a single connection to the MCP server."""
+        """
+        Attempt a single connection to the MCP server with comprehensive error handling.
+
+        This internal method performs the low-level work of establishing an MCP client
+        connection using the official SDK patterns. It handles command resolution,
+        server parameter setup, transport initialization, and session establishment.
+
+        The method implements the standard MCP connection flow:
+        1. Resolve command to executable path (may fail if command not found)
+        2. Configure server parameters with command, args, and environment
+        3. Initialize stdio transport for communication with the server process
+        4. Create and initialize the ClientSession with proper client info
+        5. Wait for server initialization with timeout protection
+
+        Failure at any step will raise an exception that is caught by the retry
+        logic in the connect() method.
+
+        Raises:
+            ValueError: If the configured command cannot be resolved to an executable
+            asyncio.TimeoutError: If server initialization takes longer than 30 seconds
+            Exception: Any other error during transport or session initialization
+
+        Side Effects:
+            - Creates server process through stdio transport
+            - Modifies self.session to store the active ClientSession
+            - Registers transport and session with exit_stack for cleanup
+            - Logs successful connection
+        """
         command = self._resolve_command()
 
         if not command:
@@ -97,6 +154,7 @@ class MCPClient:
                 f"Command '{self.config.get('command')}' not found in PATH"
             )
 
+        # Configure server parameters with environment inheritance
         server_params = StdioServerParameters(
             command=command,
             args=self.config.get("args", []),
@@ -105,17 +163,21 @@ class MCPClient:
             else None,
         )
 
+        # Initialize stdio transport for server communication
         stdio_transport = await self.exit_stack.enter_async_context(
             stdio_client(server_params)
         )
         read_stream, write_stream = stdio_transport
 
+        # Create client info for MCP handshake
         client_info = types.Implementation(name=self.name, version=self.client_version)
 
+        # Initialize client session with transport streams
         self.session = await self.exit_stack.enter_async_context(
             ClientSession(read_stream, write_stream, client_info=client_info)
         )
 
+        # Complete MCP initialization handshake with timeout
         await asyncio.wait_for(self.session.initialize(), timeout=30.0)
 
         logging.info(f"MCP client '{self.name}' connected successfully")

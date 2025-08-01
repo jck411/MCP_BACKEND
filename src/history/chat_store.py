@@ -128,9 +128,45 @@ class ChatEvent(BaseModel):
 _CONTEXT_TYPES = {"user_message", "assistant_message", "tool_result"}
 
 def _visible_to_llm(ev: ChatEvent) -> bool:
+    """
+    Determine if a chat event should be included in LLM conversation context.
+
+    This function implements the visibility filter for building conversation history
+    that gets sent to the LLM. It uses a hybrid approach that includes semantic
+    conversation content while filtering out internal system messages.
+
+    The filter includes:
+    - user_message: Direct user inputs to the conversation
+    - assistant_message: LLM responses and generated content
+    - tool_result: Results from tool executions (provides context for LLM)
+    - system_update: Only when explicitly marked as visible_to_model=True
+
+    The filter excludes by default:
+    - meta events: Internal deltas, logging, and processing events
+    - tool_call events: The call itself (result is included separately)
+    - system_update events: Unless explicitly marked for model visibility
+
+    This approach ensures the LLM sees a clean conversation flow with relevant
+    context while excluding noisy internal implementation details.
+
+    Args:
+        ev: ChatEvent to evaluate for LLM visibility
+
+    Returns:
+        bool: True if event should be included in LLM context, False otherwise
+
+    Example:
+        user_msg = ChatEvent(type="user_message", ...)  # -> True
+        assistant_msg = ChatEvent(type="assistant_message", ...)  # -> True
+        tool_result = ChatEvent(type="tool_result", ...)  # -> True
+        delta = ChatEvent(type="meta", ...)  # -> False
+        system = ChatEvent(
+            type="system_update", extra={"visible_to_model": True}
+        )  # -> True
+    """
     if ev.type in _CONTEXT_TYPES:
         return True
-    # allow system updates only when you mark them
+    # Allow system updates only when explicitly marked for model visibility
     return ev.type == "system_update" and ev.extra.get("visible_to_model", False)
 
 class ChatRepository(Protocol):
@@ -166,7 +202,30 @@ class InMemoryRepo(ChatRepository):
         self._lock = threading.Lock()
 
     def _get_next_seq(self, conversation_id: str) -> int:
-        """Get next sequence number for conversation. Must be called with lock held."""
+        """
+        Generate the next sequence number for a conversation atomically.
+
+        This internal method manages the per-conversation sequence counters that
+        ensure events within a conversation have monotonically increasing sequence
+        numbers. This is critical for maintaining event ordering and detecting
+        missing or duplicate events.
+
+        The method must be called while holding the repository lock to ensure
+        atomicity across concurrent operations. The sequence counter starts at 1
+        for the first event in each conversation.
+
+        Args:
+            conversation_id: The conversation to generate sequence number for
+
+        Returns:
+            int: The next sequence number (starting from 1 for new conversations)
+
+        Thread Safety:
+            Must be called with self._lock held. Not thread-safe on its own.
+
+        Side Effects:
+            Updates the internal _seq_counters dictionary for the conversation
+        """
         current = self._seq_counters.get(conversation_id, 0)
         next_seq = current + 1
         self._seq_counters[conversation_id] = next_seq
@@ -320,6 +379,30 @@ class JsonlRepo(ChatRepository):
         self._load()
 
     def _load(self) -> None:
+        """
+        Load and parse existing events from the JSONL file during initialization.
+
+        This internal method handles the startup process for the JsonlRepo by reading
+        the entire JSONL file and rebuilding the in-memory state. It parses each line
+        as a JSON ChatEvent and reconstructs the internal data structures needed for
+        efficient operation.
+
+        The method performs several important tasks:
+        1. Parses each JSONL line into ChatEvent objects with validation
+        2. Groups events by conversation_id for fast retrieval
+        3. Tracks the highest sequence number per conversation for counter state
+        4. Builds request_id lookup sets for O(1) duplicate detection
+        5. Caches assistant message IDs for fast response lookups
+
+        Error Handling:
+        - Skips empty lines gracefully
+        - Continues processing if individual lines fail to parse (logs error)
+        - Creates file if it doesn't exist (no error)
+
+        Side Effects:
+        - Populates _by_conv, _seq_counters, _req_ids, _last_assistant_ids
+        - May create empty file if it doesn't exist
+        """
         if not os.path.exists(self.path):
             return
         with open(self.path, encoding="utf-8") as f:
@@ -357,6 +440,36 @@ class JsonlRepo(ChatRepository):
         return next_seq
 
     def _append_sync(self, event: ChatEvent) -> None:
+        """
+        Synchronously append a single event to the JSONL file with crash safety.
+
+        This internal method handles the low-level file operations for persisting
+        ChatEvents to disk. It implements several important durability guarantees:
+        1. File locking for cross-process safety (prevents corruption)
+        2. Atomic write operations (complete line or nothing)
+        3. fsync for crash safety (survives power failures)
+        4. Proper exception handling with lock cleanup
+
+        The method uses fcntl file locking to coordinate access between multiple
+        processes that might be writing to the same JSONL file. This is critical
+        in distributed or multi-process deployments.
+
+        Args:
+            event: ChatEvent to persist to disk
+
+        Side Effects:
+            - Appends one line to the JSONL file
+            - Acquires and releases file lock
+            - Forces disk synchronization
+
+        Thread Safety:
+            Safe for concurrent use with other _append_sync calls.
+            File locking handles cross-process coordination.
+
+        Performance Notes:
+            fsync is expensive but necessary for durability. In high-throughput
+            scenarios, consider batching multiple events before syncing.
+        """
         with open(self.path, "a", encoding="utf-8") as f:
             # Add file locking for cross-process safety
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)

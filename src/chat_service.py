@@ -179,7 +179,17 @@ class ChatService:
             yield msg
 
     def _validate_streaming_support(self) -> None:
-        """Validate that streaming is supported."""
+        """
+        Validate that streaming is supported by both tool manager and LLM client.
+
+        This internal method performs fail-fast validation to ensure that all required
+        components for streaming are available before attempting to process a message.
+        Called early in process_message() to prevent partial execution.
+
+        Raises:
+            RuntimeError: If tool manager is not initialized or if LLM client
+                         doesn't support streaming functionality
+        """
         if not self.tool_mgr:
             raise RuntimeError("Tool manager not initialized")
 
@@ -193,8 +203,31 @@ class ChatService:
         self, conversation_id: str, user_msg: str, request_id: str
     ) -> bool:
         """
-        Handle user message persistence with idempotency check.
-        Returns True if processing should continue, False if response already exists.
+        Handle user message persistence with comprehensive idempotency checks.
+
+        This internal method implements the core idempotency logic for the chat system.
+        It first checks if an assistant response already exists for the given
+        request_id, then attempts to persist the user message. If the user message
+        is a duplicate, it performs a second check for existing responses to handle
+        race conditions.
+
+        The method follows a defensive programming pattern:
+        1. Check for existing response (prevents double-billing)
+        2. Attempt to persist user message
+        3. If duplicate detected, re-check for response (handles concurrent requests)
+
+        Args:
+            conversation_id: The conversation identifier
+            user_msg: The user's message content
+            request_id: Unique identifier for this request (used for idempotency)
+
+        Returns:
+            bool: True if processing should continue (new request), False if response
+                  already exists (cached response should be returned)
+
+        Side Effects:
+            - Creates a ChatEvent for the user message and persists it to repository
+            - Computes and caches token count for the user message
         """
         # Check for existing response first
         existing_response = await self._get_existing_assistant_response(
@@ -233,7 +266,29 @@ class ChatService:
     async def _yield_existing_response(
         self, conversation_id: str, request_id: str
     ) -> AsyncGenerator[ChatMessage]:
-        """Yield existing response content as ChatMessage."""
+        """
+        Yield existing response content as ChatMessage for cached responses.
+
+        This internal method retrieves and streams a previously computed assistant
+        response when handling duplicate requests. It maintains consistency with
+        the streaming interface by yielding ChatMessage objects even for cached
+        content.
+
+        Used in the idempotency flow when _handle_user_message_persistence returns
+        False, indicating that a response already exists for the given request_id.
+
+        Args:
+            conversation_id: The conversation identifier
+            request_id: The request identifier to find cached response for
+
+        Yields:
+            ChatMessage: Single message containing the cached response content
+            with metadata indicating it's from cache
+
+        Note:
+            If no existing response is found (edge case), this generator yields
+            nothing, which will result in an empty response stream.
+        """
         existing_response = await self._get_existing_assistant_response(
             conversation_id, request_id
         )
@@ -314,7 +369,26 @@ class ChatService:
         )
 
     def _log_initial_response(self, assistant_msg: dict[str, Any]) -> None:
-        """Log initial LLM response if configured."""
+        """
+        Log initial LLM response if configured in chat service settings.
+
+        This internal method provides structured logging of the first LLM response
+        in a conversation turn. It creates a standardized log entry that includes
+        the assistant message, usage information, and model details for debugging
+        and monitoring purposes.
+
+        The method respects the chat service logging configuration and only logs
+        if 'llm_replies' is enabled. It uses the _log_llm_reply helper to ensure
+        consistent log formatting across all LLM interactions.
+
+        Args:
+            assistant_msg: The raw assistant message dictionary from the LLM API,
+                          containing content, tool_calls, and other response data
+
+        Side Effects:
+            - May write to application logs if logging is enabled
+            - Does not modify the assistant_msg or any other state
+        """
         reply_data = {
             "message": assistant_msg,
             "usage": None,
@@ -389,54 +463,62 @@ class ChatService:
         message_buffer = ""
         current_tool_calls: list[dict[str, Any]] = []
         finish_reason: str | None = None
-        delta_index = 0
+        delta_index = 0  # Track delta order for proper reconstruction
 
+        # Stream from LLM API - this is where the real-time magic happens
         async for chunk in self.llm_client.get_streaming_response_with_tools(
             conv, tools_payload
         ):
+            # Skip malformed chunks (defensive programming)
             if "choices" not in chunk or not chunk["choices"]:
                 continue
 
             choice = chunk["choices"][0]
             delta = choice.get("delta", {})
 
-            # Handle content streaming - IMMEDIATE yield to user
+            # PRIORITY 1: Stream content immediately to provide responsive UX
+            # Content deltas are the most time-sensitive part of the response
             if content := delta.get("content"):
-                message_buffer += content
+                message_buffer += content  # Build complete message for final storage
 
-                # Persist delta event for history
+                # Persist this content delta for history reconstruction
+                # Each delta gets a unique index for proper ordering
                 delta_event = ChatEvent(
                     conversation_id=conversation_id,
-                    seq=0,  # Will be assigned by repository
-                    type="meta",
+                    seq=0,  # Repository will assign sequence number
+                    type="meta",  # Internal event type for system operations
                     content=content,
                     extra={
-                        "kind": "assistant_delta",
-                        "user_request_id": user_request_id,
-                        "hop_number": hop_number,
-                        "delta_index": delta_index,
-                        "request_id": user_request_id  # Add for easier queries
+                        "kind": "assistant_delta",  # Specific delta type identifier
+                        "user_request_id": user_request_id,  # Link to request
+                        "hop_number": hop_number,  # Track tool call iteration depth
+                        "delta_index": delta_index,  # Preserve streaming order
+                        "request_id": user_request_id  # Redundant for easier queries
                     }
                 )
                 await self.repo.add_event(delta_event)
-                delta_index += 1
+                delta_index += 1  # Increment for next delta
 
-                # Stream to user immediately - no waiting!
+                # IMMEDIATE USER FEEDBACK: Stream to user without waiting
+                # This is what makes the UI feel responsive during long responses
                 yield ChatMessage(
                     type="text",
                     content=content,
                     metadata={"type": "delta", "hop": hop_number}
                 )
 
-            # Handle tool calls streaming - accumulate for later execution
+            # PRIORITY 2: Accumulate tool calls for batch execution
+            # Tool calls need to be complete before execution, so we buffer them
             if tool_calls := delta.get("tool_calls"):
+                # Use robust accumulation that handles out-of-order and partial deltas
                 self._accumulate_tool_calls(current_tool_calls, tool_calls)
 
-            # Handle finish reason
+            # PRIORITY 3: Track completion status for proper flow control
             if "finish_reason" in choice:
                 finish_reason = choice["finish_reason"]
 
-        # Send tool execution status if tools were called
+        # Provide user feedback when transitioning to tool execution phase
+        # This helps users understand what's happening during longer operations
         if current_tool_calls and any(
             call["function"]["name"] for call in current_tool_calls
         ):
@@ -446,7 +528,8 @@ class ChatService:
                 metadata={"tool_count": len(current_tool_calls), "hop": hop_number}
             )
 
-        # Yield complete assistant message as final item
+        # Return complete assistant message for tool call processing
+        # This allows the caller to determine if more LLM interactions are needed
         yield {
             "content": message_buffer or None,
             "tool_calls": current_tool_calls if current_tool_calls and any(
@@ -458,9 +541,43 @@ class ChatService:
     def _accumulate_tool_calls(
         self, current_tool_calls: list[dict[str, Any]], tool_calls: list[dict[str, Any]]
     ) -> None:
-        """Accumulate streaming tool calls into the current buffer."""
+        """
+        Accumulate streaming tool call deltas into complete tool call structures.
+
+        This is a critical internal method that handles the complex task of assembling
+        tool calls from streaming deltas. LLM APIs stream tool calls in fragments:
+        - Tool call IDs may arrive first
+        - Function names may arrive in multiple chunks
+        - Function arguments arrive as partial JSON strings
+        - Deltas may arrive out of order or with missing indices
+
+        The method uses a defensive accumulation strategy:
+        1. Ensures the current_tool_calls list has enough slots for all indices
+        2. Uses list-based accumulation for both names and arguments
+        3. Rebuilds complete strings from accumulated parts after each delta
+
+        This approach handles edge cases like:
+        - Out-of-order deltas (common with parallel processing)
+        - Missing or duplicate deltas
+        - Partial JSON in arguments that needs to be concatenated
+
+        Args:
+            current_tool_calls: The mutable list being built up (modified in-place)
+            tool_calls: List of delta fragments from the current streaming chunk
+
+        Side Effects:
+            - Modifies current_tool_calls in-place by extending or updating elements
+            - Creates intermediate "_parts" lists to handle out-of-order accumulation
+            - Rebuilds name and arguments strings from parts after each update
+
+        Implementation Notes:
+            The method maintains both the final strings (name, arguments) and the
+            intermediate parts lists (name_parts, args_parts) to handle streaming
+            edge cases robustly. This prevents corruption when deltas arrive
+            out of order.
+        """
         for tool_call in tool_calls:
-            # Ensure we have enough space in the buffer
+            # Ensure we have enough space in the buffer for this tool call index
             while len(current_tool_calls) <= tool_call.get("index", 0):
                 current_tool_calls.append({
                     "id": "",
@@ -469,23 +586,35 @@ class ChatService:
                 })
 
             idx = tool_call.get("index", 0)
+
+            # Accumulate tool call ID (usually arrives first and complete)
             if "id" in tool_call:
                 current_tool_calls[idx]["id"] = tool_call["id"]
+
+            # Accumulate function details using part-based strategy
             if "function" in tool_call:
                 func = tool_call["function"]
+
+                # Handle function name accumulation (may arrive in chunks)
                 if "name" in func:
-                    # Use list-based accumulation to handle out-of-order deltas
+                    # Initialize parts list if not exists
                     if "name_parts" not in current_tool_calls[idx]["function"]:
                         current_tool_calls[idx]["function"]["name_parts"] = []
+                    # Accumulate this name fragment
                     current_tool_calls[idx]["function"]["name_parts"].append(func["name"])
+                    # Rebuild complete name from all parts
                     current_tool_calls[idx]["function"]["name"] = "".join(
                         current_tool_calls[idx]["function"]["name_parts"]
                     )
+
+                # Handle function arguments accumulation (partial JSON strings)
                 if "arguments" in func:
-                    # Use list-based accumulation for arguments too
+                    # Initialize parts list if not exists
                     if "args_parts" not in current_tool_calls[idx]["function"]:
                         current_tool_calls[idx]["function"]["args_parts"] = []
+                    # Accumulate this argument fragment
                     current_tool_calls[idx]["function"]["args_parts"].append(func["arguments"])
+                    # Rebuild complete arguments JSON from all parts
                     current_tool_calls[idx]["function"]["arguments"] = "".join(
                         current_tool_calls[idx]["function"]["args_parts"]
                     )
@@ -493,18 +622,47 @@ class ChatService:
     async def _execute_tool_calls(
         self, conv: list[dict[str, Any]], calls: list[dict[str, Any]]
     ) -> None:
-        """Execute tool calls and add results to conversation."""
+        """
+        Execute tool calls and append results to conversation history.
+
+        This internal method handles the execution phase of tool calls after they
+        have been accumulated from streaming deltas. It processes each tool call
+        sequentially, validates the JSON arguments, executes the tool through the
+        tool manager, and formats the results for inclusion in the conversation.
+
+        The method implements several important behaviors:
+        1. Parses JSON arguments with fallback to empty dict for malformed JSON
+        2. Executes tools through the tool manager (which handles validation)
+        3. Extracts content from MCP CallToolResult using _pluck_content helper
+        4. Appends tool results to conversation in OpenAI chat format
+
+        Args:
+            conv: The conversation history list (modified in-place)
+            calls: List of complete tool call dictionaries with id, name, and arguments
+
+        Side Effects:
+            - Modifies conv by appending tool result messages
+            - Executes external tool calls through MCP clients
+            - May raise exceptions if tool execution fails (handled by caller)
+
+        Note:
+            Tool calls are executed sequentially, not in parallel. This ensures
+            deterministic execution order and prevents resource conflicts between tools.
+        """
         assert self.tool_mgr is not None
 
         for call in calls:
             tool_name = call["function"]["name"]
+            # Parse JSON arguments with defensive handling for malformed JSON
             args = json.loads(call["function"]["arguments"] or "{}")
 
+            # Execute tool through tool manager (handles validation and routing)
             result = await self.tool_mgr.call_tool(tool_name, args)
 
-            # Handle structured content
+            # Extract readable content from MCP result structure
             content = self._pluck_content(result)
 
+            # Append tool result to conversation in OpenAI format
             conv.append(
                 {
                     "role": "tool",
@@ -619,7 +777,32 @@ class ChatService:
         return assistant_ev
 
     def _convert_usage(self, api_usage: dict[str, Any] | None) -> Usage:
-        """Convert LLM API usage to our Usage model."""
+        """
+        Convert LLM API usage statistics to internal Usage model.
+
+        This internal method normalizes usage data from different LLM API providers
+        into the platform's standardized Usage Pydantic model. It handles cases
+        where usage information may be missing or incomplete.
+
+        The method provides safe defaults (0 tokens) for missing fields to ensure
+        consistent usage tracking across all LLM interactions. This is important
+        for cost monitoring and rate limiting.
+
+        Args:
+            api_usage: Raw usage dictionary from LLM API response, may be None
+                      Expected fields: prompt_tokens, completion_tokens, total_tokens
+
+        Returns:
+            Usage: Pydantic model with normalized token counts, using 0 for
+                   missing fields
+
+        Example:
+            api_usage = {
+                "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15
+            }
+            usage = self._convert_usage(api_usage)
+            # Returns: Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+        """
         if not api_usage:
             return Usage()
 
@@ -757,11 +940,42 @@ class ChatService:
         logger.info(" | ".join(log_parts))
 
     def _pluck_content(self, res: types.CallToolResult) -> str:
-        """Extract content from a tool call result."""
+        """
+        Extract readable content from MCP CallToolResult for conversation context.
+
+        This internal method handles the complex task of converting MCP tool results
+        into plain text suitable for inclusion in LLM conversation context. MCP tool
+        results can contain various content types (text, images, binary data, embedded
+        resources) that need different handling strategies.
+
+        The method implements a fallback chain:
+        1. Handle structured content (if present) by JSON serialization
+        2. Process each content item based on its type:
+           - TextContent: Extract text directly
+           - ImageContent: Create descriptive placeholder
+           - BlobResourceContents: Create size-based placeholder
+           - EmbeddedResource: Recursively extract from nested resource
+           - Unknown types: Create type-based placeholder
+        3. Return "✓ done" for empty results to indicate successful completion
+
+        This approach ensures that all tool results can be meaningfully represented
+        in text form for the LLM, while preserving important metadata about non-text
+        content types.
+
+        Args:
+            res: MCP CallToolResult containing the tool execution result
+
+        Returns:
+            str: Human-readable text representation of the tool result content
+
+        Side Effects:
+            - May log warnings if structured content serialization fails
+            - Does not modify the input result object
+        """
         if not res.content:
             return "✓ done"
 
-        # Handle structured content
+        # Handle structured content with graceful fallback
         if hasattr(res, "structuredContent") and res.structuredContent:
             try:
                 return json.dumps(res.structuredContent, indent=2)

@@ -54,7 +54,34 @@ class ToolSchemaManager:
         )
 
     async def _register_client_tools(self, client: MCPClient) -> None:
-        """Register tools from a specific MCP client."""
+        """
+        Register all tools from a specific MCP client with conflict resolution.
+
+        This internal method handles the complex process of discovering tools from
+        an MCP client and integrating them into the platform's tool registry. It
+        implements several important features:
+
+        1. Connection validation: Skips disconnected clients gracefully
+        2. Name conflict resolution: Prefixes tools with client name if conflicts exist
+        3. Schema conversion: Transforms MCP tools to OpenAI-compatible format
+        4. Validation model creation: Builds Pydantic models for parameter validation
+        5. Comprehensive error handling: Logs failures but continues processing
+
+        The method is designed to be resilient to individual client failures while
+        still allowing the overall system to function with available tools.
+
+        Args:
+            client: MCP client to register tools from (must be connected)
+
+        Side Effects:
+            - Updates _tool_registry with discovered tools
+            - Updates _openai_tools with converted tool schemas
+            - Updates _schema_cache with validation models
+            - Logs registration status and any conflicts
+
+        Raises:
+            Exception: Re-raises exceptions after logging for caller handling
+        """
         # Skip clients that are not connected
         if not client.is_connected:
             logger.warning(
@@ -66,16 +93,22 @@ class ToolSchemaManager:
             tools = await client.list_tools()
             for tool in tools:
                 tool_name = tool.name
+
+                # Handle name conflicts by prefixing with client name
                 if tool_name in self._tool_registry:
                     logger.warning(f"Tool name conflict: '{tool_name}' already exists")
                     tool_name = f"{client.name}_{tool_name}"
 
+                # Convert MCP tool to OpenAI format for LLM consumption
                 openai_schema = self._convert_to_openai_schema(tool)
+
+                # Create Pydantic validation model for parameter checking
                 validation_model = self._create_validation_model(tool)
 
                 if validation_model:
                     self._schema_cache[tool_name] = validation_model
 
+                # Store complete tool information
                 tool_info = ToolInfo(tool, client, openai_schema)
                 self._tool_registry[tool_name] = tool_info
                 self._openai_tools.append(openai_schema)
@@ -156,7 +189,46 @@ class ToolSchemaManager:
         return create_model(model_name, **field_definitions)
 
     def _convert_to_openai_schema(self, tool: types.Tool) -> dict[str, Any]:
-        """Convert MCP Tool to OpenAI format."""
+        """
+        Convert MCP Tool schema to OpenAI function calling format.
+
+        This internal method handles the complex transformation between MCP's tool
+        schema format and OpenAI's function calling specification. The conversion
+        is critical for enabling LLMs to understand and call MCP tools correctly.
+
+        The conversion process:
+        1. Validates that the tool has an input schema (required for OpenAI format)
+        2. Maps MCP tool properties to OpenAI function structure
+        3. Preserves optional metadata like title and annotations
+        4. Embeds original MCP metadata for debugging and introspection
+        5. Handles edge cases like missing descriptions gracefully
+
+        The resulting schema follows OpenAI's function calling specification:
+        ```json
+        {
+            "type": "function",
+            "function": {
+                "name": "tool_name",
+                "description": "Tool description",
+                "parameters": {...JSON schema...}
+            }
+        }
+        ```
+
+        Args:
+            tool: MCP Tool object with name, description, and input schema
+
+        Returns:
+            dict: OpenAI-compatible function schema ready for LLM consumption
+
+        Raises:
+            ValueError: If tool lacks required input schema
+
+        Implementation Notes:
+            - Preserves original MCP metadata in _mcp_metadata field for debugging
+            - Uses "No description provided" fallback for tools without descriptions
+            - Maintains full schema compatibility with OpenAI API expectations
+        """
         if not tool.inputSchema:
             raise ValueError(f"Tool {tool.name} has no input schema")
 
@@ -169,6 +241,7 @@ class ToolSchemaManager:
             },
         }
 
+        # Preserve optional MCP metadata
         if tool.title:
             openai_schema["function"]["title"] = tool.title
 
@@ -178,6 +251,7 @@ class ToolSchemaManager:
         if tool.outputSchema:
             openai_schema["function"]["output_schema"] = tool.outputSchema
 
+        # Embed original MCP metadata for debugging and introspection
         openai_schema["function"]["_mcp_metadata"] = {
             "original_tool": tool.model_dump(exclude_none=True),
             "sdk_version": "1.12.0+",

@@ -49,16 +49,22 @@ def build_conversation_with_token_limit(
     Returns:
         Tuple of (conversation_list, total_tokens_used)
     """
-    # Start with system prompt and user message
+    # Start with minimal conversation: system + current user message
+    # This establishes the baseline token cost that we cannot reduce
     base_conversation = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
     ]
 
-    # Calculate base tokens
+    # Calculate the immutable token cost (system prompt + user message)
     base_tokens = count_conversation_tokens(base_conversation)
+
+    # Calculate how many tokens we have available for historical events
+    # This is our "budget" for including conversation history
     available_tokens = max_tokens - base_tokens - reserve_tokens
 
+    # Early exit if system prompt + user message already exceed limits
+    # This prevents infinite loops and provides clear error messaging
     if available_tokens <= 0:
         logger.warning(
             f"System prompt and user message exceed token limit. "
@@ -66,33 +72,43 @@ def build_conversation_with_token_limit(
         )
         return base_conversation, base_tokens
 
-    # Build conversation with events, respecting token limit
+    # Build conversation incrementally, starting with system prompt
+    # We'll add historical events between system and user message
     conversation = [{"role": "system", "content": system_prompt}]
 
-    # Add events in order, checking token limits
+    # Process events in chronological order to maintain conversation flow
+    # Each event is tested before inclusion to ensure we don't exceed limits
     for event in events:
+        # Only include events that make sense in LLM conversation context
         if event.type in ("user_message", "assistant_message", "system_update"):
             event_msg = {"role": event.role, "content": event.content or ""}
 
-            # Calculate tokens for this event
+            # Create test conversation with this event included
+            # This allows us to calculate exact token impact
             test_conversation = [*conversation, event_msg]
 
-            # Check if adding this event would exceed the limit
+            # Calculate final token count if we include this event + user message
+            # The user message must always be last, so we simulate the final state
             final_tokens_with_user = count_conversation_tokens(
                 [*test_conversation, {"role": "user", "content": user_message}]
             )
 
+            # Check if including this event would breach our token budget
+            # We need to account for both the final conversation AND reserved tokens
             if final_tokens_with_user + reserve_tokens > max_tokens:
                 logger.debug(
                     f"Stopping conversation build at {len(conversation)} messages. "
                     f"Would use {final_tokens_with_user} + {reserve_tokens} tokens."
                 )
-                break
+                break  # Stop adding events - we've hit our limit
 
+            # Safe to include this event - add it to the conversation
             conversation.append(event_msg)
 
-    # Add the user message
+    # Always append the current user message last (required for OpenAI format)
     conversation.append({"role": "user", "content": user_message})
+
+    # Calculate and return final token count for monitoring/logging
     final_tokens = count_conversation_tokens(conversation)
 
     return conversation, final_tokens
