@@ -132,3 +132,39 @@ class Configuration:
             Chat service configuration dictionary.
         """
         return self._config.get("chat", {}).get("service", {})
+
+    def get_mcp_connection_config(self) -> dict[str, Any]:
+        """Get MCP connection configuration from YAML.
+
+        Returns:
+            MCP connection configuration dictionary with validated defaults.
+        """
+        mcp_config = self._config.get("mcp", {})
+        connection_config = mcp_config.get("connection", {})
+
+        # Get values with defaults
+        max_attempts = connection_config.get("max_reconnect_attempts", 5)
+        initial_delay = connection_config.get("initial_reconnect_delay", 1.0)
+        max_delay = connection_config.get("max_reconnect_delay", 30.0)
+        connection_timeout = connection_config.get("connection_timeout", 30.0)
+        ping_timeout = connection_config.get("ping_timeout", 10.0)
+
+        # Validate configuration values
+        if max_attempts < 1:
+            raise ValueError("max_reconnect_attempts must be at least 1")
+        if initial_delay <= 0:
+            raise ValueError("initial_reconnect_delay must be positive")
+        if max_delay < initial_delay:
+            raise ValueError("max_reconnect_delay must be >= initial_reconnect_delay")
+        if connection_timeout <= 0:
+            raise ValueError("connection_timeout must be positive")
+        if ping_timeout <= 0:
+            raise ValueError("ping_timeout must be positive")
+
+        return {
+            "max_reconnect_attempts": max_attempts,
+            "initial_reconnect_delay": initial_delay,
+            "max_reconnect_delay": max_delay,
+            "connection_timeout": connection_timeout,
+            "ping_timeout": ping_timeout,
+        }

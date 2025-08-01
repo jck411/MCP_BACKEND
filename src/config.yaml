@@ -95,3 +95,21 @@ logging:
 # MCP Server Configuration
 mcp:
   config_file: "servers_config.json"
+  
+  # Connection and retry configuration
+  connection:
+    # Maximum number of reconnection attempts per server
+    max_reconnect_attempts: 5
+    
+    # Initial delay between reconnection attempts (seconds)
+    # Uses exponential backoff up to max_reconnect_delay
+    initial_reconnect_delay: 1.0
+    
+    # Maximum delay between reconnection attempts (seconds)
+    max_reconnect_delay: 30.0
+    
+    # Connection timeout for initial server connection (seconds)
+    connection_timeout: 30.0
+    
+    # Ping timeout for connection health checks (seconds)
+    ping_timeout: 10.0

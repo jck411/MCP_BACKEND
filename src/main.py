@@ -29,19 +29,67 @@ logging.basicConfig(
 
 
 class MCPClient:
-    """Official MCP Client implementation following SDK patterns."""
+    """
+    Official MCP Client implementation following SDK patterns.
 
-    def __init__(self, name: str, config: dict[str, Any]) -> None:
+    Supports configurable connection timeout and retry behavior through YAML
+    configuration. Connection parameters include:
+    - max_reconnect_attempts: Maximum number of reconnection attempts
+    - initial_reconnect_delay: Initial delay between reconnection attempts
+    - max_reconnect_delay: Maximum delay (with exponential backoff)
+    - connection_timeout: Timeout for server initialization
+    - ping_timeout: Timeout for connection health checks
+    """
+
+    def __init__(
+        self,
+        name: str,
+        config: dict[str, Any],
+        connection_config: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Initialize MCP client with configurable connection parameters.
+
+        Args:
+            name: Client name for logging and identification
+            config: Server-specific configuration (command, args, etc.)
+            connection_config: Connection and retry configuration parameters
+        """
         self.name: str = name
         self.config: dict[str, Any] = config
         self.session: ClientSession | None = None
         self.exit_stack: AsyncExitStack = AsyncExitStack()
         self._cleanup_lock: asyncio.Lock = asyncio.Lock()
         self._reconnect_attempts: int = 0
-        self._max_reconnect_attempts: int = 5
-        self._reconnect_delay: float = 1.0
         self._is_connected: bool = False
         self.client_version = "0.1.0"
+
+        # Configure connection parameters from config or use defaults
+        conn_config = connection_config or {}
+        self._max_reconnect_attempts: int = conn_config.get(
+            "max_reconnect_attempts", 5
+        )
+        self._initial_reconnect_delay: float = conn_config.get(
+            "initial_reconnect_delay", 1.0
+        )
+        self._max_reconnect_delay: float = conn_config.get(
+            "max_reconnect_delay", 30.0
+        )
+        self._connection_timeout: float = conn_config.get("connection_timeout", 30.0)
+        self._ping_timeout: float = conn_config.get("ping_timeout", 10.0)
+
+        # Initialize reconnect delay to the configured initial value
+        self._reconnect_delay: float = self._initial_reconnect_delay
+
+        # Log configuration for debugging
+        logging.info(
+            f"MCP client '{name}' configured with: "
+            f"max_attempts={self._max_reconnect_attempts}, "
+            f"initial_delay={self._initial_reconnect_delay}s, "
+            f"max_delay={self._max_reconnect_delay}s, "
+            f"connection_timeout={self._connection_timeout}s, "
+            f"ping_timeout={self._ping_timeout}s"
+        )
 
     def _resolve_command(self) -> str | None:
         """
@@ -93,12 +141,26 @@ class MCPClient:
         return resolved
 
     async def connect(self) -> None:
-        """Connect to MCP server using official transport patterns."""
+        """
+        Connect to MCP server using official transport patterns with configurable
+        retry logic.
+
+        Implements exponential backoff retry strategy using configuration parameters:
+        - Retries up to max_reconnect_attempts times
+        - Uses initial_reconnect_delay as starting delay, doubling each attempt
+        - Caps delay at max_reconnect_delay to prevent excessive wait times
+- Resets delay and attempt count on successful connection
+
+        Raises:
+            Exception: If all connection attempts fail
+        """
         while self._reconnect_attempts < self._max_reconnect_attempts:
             try:
                 await self._attempt_connection()
                 self._is_connected = True
                 self._reconnect_attempts = 0
+                # Reset delay for future reconnection attempts
+                self._reconnect_delay = self._initial_reconnect_delay
                 return
             except Exception as e:
                 self._reconnect_attempts += 1
@@ -116,7 +178,11 @@ class MCPClient:
                     f"{self.name}: {e}. Retrying in {self._reconnect_delay}s..."
                 )
                 await asyncio.sleep(self._reconnect_delay)
-                self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
+
+                # Apply exponential backoff with maximum delay limit
+                self._reconnect_delay = min(
+                    self._reconnect_delay * 2, self._max_reconnect_delay
+                )
 
     async def _attempt_connection(self) -> None:
         """
@@ -177,8 +243,10 @@ class MCPClient:
             ClientSession(read_stream, write_stream, client_info=client_info)
         )
 
-        # Complete MCP initialization handshake with timeout
-        await asyncio.wait_for(self.session.initialize(), timeout=30.0)
+        # Complete MCP initialization handshake with configurable timeout
+        await asyncio.wait_for(
+            self.session.initialize(), timeout=self._connection_timeout
+        )
 
         logging.info(f"MCP client '{self.name}' connected successfully")
 
@@ -188,7 +256,10 @@ class MCPClient:
             return False
 
         try:
-            await self.session.list_tools()
+            # Use list_tools() as a lightweight ping with configurable timeout
+            await asyncio.wait_for(
+                self.session.list_tools(), timeout=self._ping_timeout
+            )
             return True
         except Exception as e:
             logging.warning(f"Ping failed for {self.name}: {e}")
@@ -576,11 +647,14 @@ async def main() -> None:
     config_path = os.path.join(os.path.dirname(__file__), "servers_config.json")
     servers_config = config.load_config(config_path)
 
+    # Get MCP connection configuration
+    mcp_connection_config = config.get_mcp_connection_config()
+
     clients = []
     for name, server_config in servers_config["mcpServers"].items():
         # Only create clients for enabled servers
         if server_config.get("enabled", False):
-            clients.append(MCPClient(name, server_config))
+            clients.append(MCPClient(name, server_config, mcp_connection_config))
         else:
             logging.info(f"Skipping disabled server: {name}")
 
