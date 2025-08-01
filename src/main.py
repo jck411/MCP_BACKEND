@@ -167,6 +167,8 @@ class MCPClient:
                 self._is_connected = False
 
                 if self._reconnect_attempts >= self._max_reconnect_attempts:
+                    # Reset delay for future connection attempts
+                    self._reconnect_delay = self._initial_reconnect_delay
                     logging.error(
                         f"Failed to connect to {self.name} after "
                         f"{self._max_reconnect_attempts} attempts: {e}"
