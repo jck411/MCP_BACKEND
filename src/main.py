@@ -24,7 +24,7 @@ from pydantic import AnyUrl
 import src.chat_service
 from src.chat_service import ChatService
 from src.config import Configuration
-from src.history.chat_store import AsyncJsonlRepo, InMemoryRepo, JsonlRepo
+from src.history.chat_store import AsyncJsonlRepo
 from src.websocket_server import run_websocket_server
 
 logging.basicConfig(
@@ -648,22 +648,14 @@ class LLMClient:
 
 def create_repository(
     config: Configuration,
-) -> JsonlRepo | AsyncJsonlRepo | InMemoryRepo:
+) -> AsyncJsonlRepo:
     """Create repository instance based on configuration."""
     service_config = config.get_config_dict().get("chat", {}).get("service", {})
     repo_config = service_config.get("repository", {})
-    repo_type = repo_config.get("type", "jsonl")
     repo_path = repo_config.get("path", "events.jsonl")
 
-    if repo_type == "async_jsonl":
-        logging.info(f"Using AsyncJsonlRepo with path: {repo_path}")
-        return AsyncJsonlRepo(repo_path)
-    if repo_type == "memory":
-        logging.info("Using InMemoryRepo")
-        return InMemoryRepo()
-    # Default to "jsonl"
-    logging.info(f"Using JsonlRepo with path: {repo_path}")
-    return JsonlRepo(repo_path)
+    logging.info(f"Using AsyncJsonlRepo with path: {repo_path}")
+    return AsyncJsonlRepo(repo_path)
 
 
 async def main() -> None:
