@@ -86,5 +86,10 @@ warn_unreachable = true
 requires = ["hatchling>=1.21.0"]
 build-backend = "hatchling.build"
 
+[dependency-groups]
+dev = [
+    "pytest-asyncio>=1.1.0",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src"]

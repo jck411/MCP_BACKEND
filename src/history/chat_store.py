@@ -197,6 +197,8 @@ class InMemoryRepo(ChatRepository):
         self._by_conv: dict[str, list[ChatEvent]] = {}
         self._seq_counters: dict[str, int] = {}  # Per-conversation sequence counters
         self._req_ids: dict[str, set[str]] = {}  # Per-conversation fast request_id sets
+        # conv_id -> {request_id -> event} for O(1) event lookup by request_id
+        self._req_id_to_event: dict[str, dict[str, ChatEvent]] = {}
         # conv_id -> {user_req_id -> asst_id}
         self._last_assistant_ids: dict[str, dict[str, str]] = {}
         self._lock = threading.Lock()
@@ -246,10 +248,13 @@ class InMemoryRepo(ChatRepository):
             event.seq = self._get_next_seq(event.conversation_id)
             events.append(event)
 
-            # Add request_id to fast lookup set
+            # Add request_id to fast lookup structures
             if request_id:
                 req_ids = self._req_ids.setdefault(event.conversation_id, set())
                 req_ids.add(request_id)
+                # Add to request_id -> event mapping for O(1) retrieval
+                req_map = self._req_id_to_event.setdefault(event.conversation_id, {})
+                req_map[request_id] = event
 
             return True  # Successfully added
 
@@ -286,11 +291,9 @@ class InMemoryRepo(ChatRepository):
         self, conversation_id: str, request_id: str
     ) -> ChatEvent | None:
         with self._lock:
-            events = self._by_conv.get(conversation_id, [])
-            for event in events:
-                if event.extra.get("request_id") == request_id:
-                    return event
-            return None
+            # O(1) lookup using indexed request_id mapping
+            req_map = self._req_id_to_event.get(conversation_id, {})
+            return req_map.get(request_id)
 
     async def get_last_assistant_reply_id(
         self, conversation_id: str, user_request_id: str
@@ -354,6 +357,9 @@ class InMemoryRepo(ChatRepository):
 
             # Add to request_id set to prevent duplicate compaction
             req_ids.add(assistant_req_id)
+            # Add to request_id -> event mapping for O(1) retrieval
+            req_map = self._req_id_to_event.setdefault(conversation_id, {})
+            req_map[assistant_req_id] = assistant_event
 
             # Cache assistant ID for O(1) lookup
             asst_cache = self._last_assistant_ids.setdefault(conversation_id, {})
@@ -374,6 +380,8 @@ class JsonlRepo(ChatRepository):
         self._by_conv: dict[str, list[ChatEvent]] = {}
         self._seq_counters: dict[str, int] = {}  # Per-conversation sequence counters
         self._req_ids: dict[str, set[str]] = {}  # Per-conversation fast request_id sets
+        # conv_id -> {request_id -> event} for O(1) event lookup by request_id
+        self._req_id_to_event: dict[str, dict[str, ChatEvent]] = {}
         # conv_id -> {user_req_id -> asst_id}
         self._last_assistant_ids: dict[str, dict[str, str]] = {}
         self._load()
@@ -424,6 +432,9 @@ class JsonlRepo(ChatRepository):
                 if request_id:
                     req_ids = self._req_ids.setdefault(ev.conversation_id, set())
                     req_ids.add(request_id)
+                    # Build request_id -> event mapping for O(1) retrieval
+                    req_map = self._req_id_to_event.setdefault(ev.conversation_id, {})
+                    req_map[request_id] = ev
 
                 # Cache assistant IDs for O(1) lookup
                 if (ev.type == "assistant_message" and
@@ -500,10 +511,13 @@ class JsonlRepo(ChatRepository):
             events.append(event)
             self._append_sync(event)
 
-            # Add request_id to fast lookup set
+            # Add request_id to fast lookup structures
             if request_id:
                 req_ids = self._req_ids.setdefault(event.conversation_id, set())
                 req_ids.add(request_id)
+                # Add to request_id -> event mapping for O(1) retrieval
+                req_map = self._req_id_to_event.setdefault(event.conversation_id, {})
+                req_map[request_id] = event
 
             return True  # Successfully added
 
@@ -544,11 +558,9 @@ class JsonlRepo(ChatRepository):
         self, conversation_id: str, request_id: str
     ) -> ChatEvent | None:
         with self._lock:
-            events = self._by_conv.get(conversation_id, [])
-            for event in events:
-                if event.extra.get("request_id") == request_id:
-                    return event
-            return None
+            # O(1) lookup using indexed request_id mapping
+            req_map = self._req_id_to_event.get(conversation_id, {})
+            return req_map.get(request_id)
 
     async def get_last_assistant_reply_id(
         self, conversation_id: str, user_request_id: str
@@ -613,6 +625,9 @@ class JsonlRepo(ChatRepository):
 
             # Add to request_id set to prevent duplicate compaction
             req_ids.add(assistant_req_id)
+            # Add to request_id -> event mapping for O(1) retrieval
+            req_map = self._req_id_to_event.setdefault(conversation_id, {})
+            req_map[assistant_req_id] = assistant_event
 
             # Cache assistant ID for O(1) lookup
             asst_cache = self._last_assistant_ids.setdefault(conversation_id, {})
