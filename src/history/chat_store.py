@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
@@ -374,6 +375,7 @@ class AsyncJsonlRepo(ChatRepository):
     - Async-compatible lock acquisition via run_in_executor
     - Memory-efficient streaming for large file loads
     - Full compatibility with ChatRepository protocol
+    - Optional fsync for maximum durability in crash-sensitive environments
 
     Performance Benefits:
     - No thread pool context switching overhead for file operations
@@ -386,10 +388,15 @@ class AsyncJsonlRepo(ChatRepository):
     - Safe for concurrent access from multiple processes/containers
     - Prevents file corruption in distributed deployments
     - Maintains data consistency across process boundaries
+
+    Durability Options:
+    - fsync_enabled: When True, forces data to persistent storage for crash safety
+    - When False, relies on OS buffer flushing for better performance
     """
 
-    def __init__(self, path: str = "events.jsonl"):
+    def __init__(self, path: str = "events.jsonl", fsync_enabled: bool = True):
         self.path = path
+        self.fsync_enabled = fsync_enabled
         self._lock = asyncio.Lock()
         self._by_conv: dict[str, list[ChatEvent]] = {}
         self._seq_counters: dict[str, int] = {}
@@ -483,7 +490,7 @@ class AsyncJsonlRepo(ChatRepository):
         - Cross-process file locking via FileLock (not just single-process asyncio.Lock)
         - Async-compatible lock acquisition using run_in_executor
         - Atomic write operations (complete line or nothing)
-        - File flushing for durability
+        - File flushing and optional fsync for maximum durability
         - Exception handling with proper lock cleanup
 
         Args:
@@ -493,6 +500,7 @@ class AsyncJsonlRepo(ChatRepository):
         - Uses dedicated async file locking for true cross-process safety
         - Maintains durability guarantees while being async-compatible
         - More robust than relying solely on asyncio.Lock for multi-process scenarios
+        - Optional fsync ensures data reaches persistent storage for crash safety
         """
         async with (
             async_file_lock(self.path),
@@ -503,7 +511,10 @@ class AsyncJsonlRepo(ChatRepository):
             )
             await f.write(data + "\n")
             await f.flush()
-            # For maximum durability, fsync could be added using run_in_executor
+            # Force data to persistent storage for maximum durability
+            if self.fsync_enabled:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, os.fsync, f.fileno())
 
     async def add_event(self, event: ChatEvent) -> bool:
         """Add a new event to the repository with async file I/O."""
@@ -662,8 +673,9 @@ if __name__ == "__main__":
     logger = logging.getLogger(__name__)
 
     async def main():
-        """Demo script showing AsyncJsonlRepo usage."""
-        repo = AsyncJsonlRepo("demo_events.jsonl")
+        """Demo script showing AsyncJsonlRepo usage with fsync options."""
+        # Demo with fsync enabled for maximum durability
+        repo = AsyncJsonlRepo("demo_events.jsonl", fsync_enabled=True)
         conv_id = str(uuid.uuid4())
 
         # Add a user message
@@ -674,7 +686,7 @@ if __name__ == "__main__":
             content="Hello, world!"
         )
         await repo.add_event(user_event)
-        logger.info(f"Added user event with seq: {user_event.seq}")
+        logger.info(f"Added user event with seq: {user_event.seq} (fsync enabled)")
 
         # Add an assistant response
         assistant_event = ChatEvent(
@@ -685,7 +697,19 @@ if __name__ == "__main__":
             usage=Usage(prompt_tokens=10, completion_tokens=15, total_tokens=25)
         )
         await repo.add_event(assistant_event)
-        logger.info(f"Added assistant event with seq: {assistant_event.seq}")
+        logger.info(
+            f"Added assistant event with seq: {assistant_event.seq} (fsync enabled)"
+        )
+
+        # Demo with fsync disabled for higher performance
+        fast_repo = AsyncJsonlRepo("demo_events_fast.jsonl", fsync_enabled=False)
+        await fast_repo.add_event(ChatEvent(
+            conversation_id=conv_id,
+            type="user_message",
+            role="user",
+            content="Fast write without fsync"
+        ))
+        logger.info("Added event with fsync disabled (higher performance)")
 
         # Retrieve events
         events = await repo.get_events(conv_id)
@@ -696,5 +720,12 @@ if __name__ == "__main__":
         logger.info(f"Token-filtered events: {len(token_events)}")
 
         logger.info("Demo completed successfully!")
+        logger.info(
+            "fsync_enabled=True: Maximum durability for crash-sensitive environments"
+        )
+        logger.info(
+            "fsync_enabled=False: Higher performance when OS-level caching "
+            "is sufficient"
+        )
 
     asyncio.run(main())
