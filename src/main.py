@@ -5,10 +5,12 @@ Main module for MCP client implementation.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import shutil
+import signal
 import sys
 from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack
@@ -645,7 +647,7 @@ class LLMClient:
 
 
 async def main() -> None:
-    """Main entry point - WebSocket interface only."""
+    """Main entry point - WebSocket interface with graceful shutdown handling."""
     config = Configuration()
 
     config_path = os.path.join(os.path.dirname(__file__), "servers_config.json")
@@ -674,10 +676,55 @@ async def main() -> None:
     src.chat_service.LLMClient = LLMClient  # type: ignore[attr-defined]
     ChatService.ChatServiceConfig.model_rebuild()
 
+    # Setup graceful shutdown handler
+    shutdown_event = asyncio.Event()
+
+    def signal_handler() -> None:
+        """Handle shutdown signals gracefully."""
+        logging.info("Received shutdown signal, initiating graceful shutdown...")
+        shutdown_event.set()
+
+    # Register signal handlers for graceful shutdown
+    if sys.platform != "win32":
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, signal_handler)
+
     async with LLMClient(llm_config, api_key) as llm_client:
-        await run_websocket_server(
-            clients, llm_client, config.get_config_dict(), repo, config
-        )
+        try:
+            # Run server with shutdown handling
+            server_task = asyncio.create_task(
+                run_websocket_server(
+                    clients, llm_client, config.get_config_dict(), repo, config
+                )
+            )
+
+            # Wait for either server completion or shutdown signal
+            done, pending = await asyncio.wait(
+                [server_task, asyncio.create_task(shutdown_event.wait())],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # Cancel pending tasks if shutdown was requested
+            for task in pending:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+            # Check if server task completed with an exception
+            for task in done:
+                if task == server_task:
+                    exception = task.exception()
+                    if exception is not None:
+                        raise exception
+
+        except KeyboardInterrupt:
+            logging.info("Keyboard interrupt received, shutting down...")
+        except Exception as e:
+            logging.error(f"Application error: {e}")
+            raise
+        finally:
+            logging.info("Application shutdown complete")
 
 
 if __name__ == "__main__":

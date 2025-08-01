@@ -1130,7 +1130,7 @@ class ChatService:
         )
 
     async def cleanup(self) -> None:
-        """Clean up resources by closing all connected MCP clients."""
+        """Clean up resources by closing all connected MCP clients and LLM client."""
         if not self.tool_mgr:
             raise RuntimeError("Tool manager not initialized")
 
@@ -1140,6 +1140,13 @@ class ChatService:
                 await client.close()
             except Exception as e:
                 logger.warning(f"Error closing client {client.name}: {e}")
+
+        # Close LLM HTTP client to prevent dangling connections
+        try:
+            await self.llm_client.close()
+            logger.info("LLM client closed successfully")
+        except Exception as e:
+            logger.warning(f"Error closing LLM client: {e}")
 
     async def apply_prompt(self, name: str, args: dict[str, str]) -> list[dict]:
         """Apply a parameterized prompt and return conversation messages."""

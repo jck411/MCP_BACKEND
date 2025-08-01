@@ -389,7 +389,7 @@ class WebSocketServer:
         )
 
     async def start_server(self):
-        """Start the WebSocket server."""
+        """Start the WebSocket server with comprehensive cleanup."""
         # Initialize chat service
         await self.chat_service.initialize()
 
@@ -404,8 +404,19 @@ class WebSocketServer:
 
         try:
             await server.serve()
+        except KeyboardInterrupt:
+            logger.info("Received shutdown signal, cleaning up...")
+        except Exception as e:
+            logger.error(f"WebSocket server error: {e}")
+            raise
         finally:
-            await self.chat_service.cleanup()
+            logger.info("Shutting down WebSocket server and cleaning up resources...")
+            try:
+                await self.chat_service.cleanup()
+                logger.info("Chat service cleanup completed")
+            except Exception as e:
+                logger.error(f"Error during chat service cleanup: {e}")
+                # Don't re-raise cleanup errors to avoid masking the original exception
 
 
 async def run_websocket_server(
