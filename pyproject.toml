@@ -25,6 +25,7 @@ dependencies = [
     "openpyxl>=3.1.2", # For Excel file support
     "tiktoken>=0.7.0", # For accurate token counting
     "aiofiles>=24.1.0", # For async file I/O operations
+    "filelock>=3.18.0",
 ]
 
 [project.scripts]

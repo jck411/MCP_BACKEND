@@ -39,17 +39,54 @@ import logging
 import os
 import threading
 import uuid
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from datetime import datetime
 from functools import partial
 from typing import Any, Literal, Protocol
 
 import aiofiles
+from filelock import FileLock
 from pydantic import BaseModel, Field
 
 from src.history.token_counter import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def async_file_lock(file_path: str) -> AsyncGenerator[None]:
+    """
+    Async context manager for cross-process file locking.
+
+    This function provides robust cross-process file locking using the filelock
+    library in an async-compatible way. It creates a lock file alongside the
+    target file and ensures exclusive access across multiple processes.
+
+    Args:
+        file_path: Path to the file that needs to be locked
+
+    Yields:
+        None: The lock is held during the context manager's execution
+
+    Example:
+        async with async_file_lock("events.jsonl"):
+            # Perform file operations with exclusive access
+            async with aiofiles.open("events.jsonl", "a") as f:
+                await f.write("data\n")
+    """
+    lock_path = f"{file_path}.lock"
+    file_lock = FileLock(lock_path)
+
+    # Use run_in_executor to make the blocking lock acquisition async-compatible
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, file_lock.acquire)
+
+    try:
+        yield
+    finally:
+        # Release the lock in executor as well to ensure it's non-blocking
+        await loop.run_in_executor(None, file_lock.release)
 # ---------- Canonical models (Pydantic v2) ----------
 
 Role = Literal["system", "user", "assistant", "tool"]
@@ -655,28 +692,30 @@ class JsonlRepo(ChatRepository):
 
 class AsyncJsonlRepo(ChatRepository):
     """
-    High-performance async file I/O version of JsonlRepo for high-throughput
-deployments.
+    High-performance async file I/O version of JsonlRepo with robust cross-process
+    locking.
 
-    This implementation uses aiofiles for truly asynchronous file operations,
-    eliminating the thread pool overhead of the original JsonlRepo. Key improvements:
+    This implementation uses aiofiles for truly asynchronous file operations and the
+    filelock library for cross-process safety, eliminating both thread pool overhead
+    and single-process locking limitations. Key improvements:
 
     - Native async file I/O using aiofiles instead of threading.Thread
-    - Async file locking to prevent corruption in concurrent scenarios
-    - Batching support for high-throughput write operations
+    - Cross-process file locking using FileLock for multi-process safety
+    - Async-compatible lock acquisition via run_in_executor
     - Memory-efficient streaming for large file loads
     - Full compatibility with ChatRepository protocol
 
     Performance Benefits:
-    - No thread pool context switching overhead
+    - No thread pool context switching overhead for file operations
     - Better scalability under high concurrent load
     - Reduced memory pressure from thread pools
     - Native async/await integration throughout
 
-    Thread Safety:
-    - Uses asyncio.Lock instead of threading.Lock for async compatibility
-    - Maintains same data consistency guarantees as JsonlRepo
-    - Safe for concurrent use in async/await contexts
+    Cross-Process Safety:
+    - Uses FileLock for true cross-process file locking (not just asyncio.Lock)
+    - Safe for concurrent access from multiple processes/containers
+    - Prevents file corruption in distributed deployments
+    - Maintains data consistency across process boundaries
     """
 
     def __init__(self, path: str = "events.jsonl"):
@@ -768,36 +807,33 @@ deployments.
         """
         Asynchronously append a single event to the JSONL file with crash safety.
 
-        This method provides the same durability guarantees as JsonlRepo._append_sync()
-        but uses async file operations for better performance in high-throughput
-        scenarios.
+        This method provides robust cross-process file locking using the filelock
+        library, ensuring safe concurrent access from multiple processes. Key features:
 
-        Features:
-        - Async file locking for cross-process safety
+        - Cross-process file locking via FileLock (not just single-process asyncio.Lock)
+        - Async-compatible lock acquisition using run_in_executor
         - Atomic write operations (complete line or nothing)
         - File flushing for durability
-        - Exception handling with proper cleanup
-        
+        - Exception handling with proper lock cleanup
+
         Args:
             event: ChatEvent to persist to disk
-            
+
         Performance Notes:
-        - Uses aiofiles for non-blocking I/O operations
-        - More efficient than thread pool for high-concurrency scenarios
-        - Maintains same durability guarantees as synchronous version
-        """  # noqa: W293
-        async with aiofiles.open(self.path, "a", encoding="utf-8") as f:
-            # Note: aiofiles doesn't support fcntl directly, but for most use cases
-            # the async lock provides sufficient coordination. For true cross-process
-            # safety with file locking, consider using a dedicated file locking library
+        - Uses dedicated async file locking for true cross-process safety
+        - Maintains durability guarantees while being async-compatible
+        - More robust than relying solely on asyncio.Lock for multi-process scenarios
+        """
+        async with (
+            async_file_lock(self.path),
+            aiofiles.open(self.path, "a", encoding="utf-8") as f,
+        ):
             data = json.dumps(
                 event.model_dump(mode="json"), ensure_ascii=False
             )
             await f.write(data + "\n")
             await f.flush()
-            # Note: aiofiles doesn't expose fsync directly. For maximum durability,
-            # you could use aiofiles.os.fsync(f.fileno()) but it requires
-            # additional setup
+            # For maximum durability, fsync could be added using run_in_executor
 
     async def add_event(self, event: ChatEvent) -> bool:
         """Add a new event to the repository with async file I/O."""
