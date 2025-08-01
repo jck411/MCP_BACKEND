@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, ValidationError
 
 from src.chat_service import ChatService
 from src.history.chat_store import ChatRepository
@@ -22,6 +23,28 @@ if TYPE_CHECKING:
     from src.main import LLMClient, MCPClient
 
 logger = logging.getLogger(__name__)
+
+
+# Pydantic models for WebSocket message validation
+class ChatPayload(BaseModel):
+    """Payload for chat messages with validation."""
+    text: str
+    streaming: bool | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class WebSocketMessage(BaseModel):
+    """WebSocket message structure with validation."""
+    request_id: str
+    payload: ChatPayload
+    message_type: str = "chat"
+
+
+class WebSocketResponse(BaseModel):
+    """WebSocket response structure."""
+    request_id: str
+    status: str  # "processing", "streaming", "completed", "error"
+    chunk: dict[str, Any] = Field(default_factory=dict)
 
 
 class WebSocketServer:
@@ -92,100 +115,84 @@ class WebSocketServer:
                 if message_data.get("action") == "chat":
                     await self._handle_chat_message(websocket, message_data)
                 else:
-                    # Unknown message format
+                    # Unknown message format - use Pydantic response
                     logger.warning(f"Unknown message format: {message_data}")
-                    await websocket.send_text(
-                        json.dumps(
-                            {
-                                "status": "error",
-                                "chunk": {
-                                    "error": (
-                                        "Unknown message format. "
-                                        "Expected 'action': 'chat'"
-                                    )
-                                },
-                            }
-                        )
+                    error_response = WebSocketResponse(
+                        request_id=message_data.get("request_id", "unknown"),
+                        status="error",
+                        chunk={
+                            "error": (
+                                "Unknown message format. "
+                                "Expected 'action': 'chat'"
+                            )
+                        }
                     )
+                    await websocket.send_text(error_response.model_dump_json())
 
         except WebSocketDisconnect:
             logger.info("WebSocket disconnected")
         except Exception as e:
             logger.error(f"WebSocket error: {e}")
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "status": "error",
-                        "chunk": {"error": f"Server error: {e!s}"},
-                    }
-                )
+            error_response = WebSocketResponse(
+                request_id="unknown",
+                status="error",
+                chunk={"error": f"Server error: {e!s}"}
             )
+            await websocket.send_text(error_response.model_dump_json())
         finally:
             self._disconnect_websocket(websocket)
 
     async def _handle_chat_message(
         self, websocket: WebSocket, message_data: dict[str, Any]
     ):
-        """Handle a chat message from the frontend."""
-        request_id = message_data.get("request_id")
-        if not request_id:
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "status": "error",
-                        "chunk": {"error": "request_id is required"},
-                    }
-                )
+        """Handle a chat message from the frontend with Pydantic validation."""
+        try:
+            # Validate message structure using Pydantic
+            ws_message = WebSocketMessage.model_validate(message_data)
+        except ValidationError as e:
+            await self._send_error_response(
+                websocket,
+                message_data.get("request_id", "unknown"),
+                f"Invalid message format: {e}"
             )
             return
 
-        payload = message_data.get("payload", {})
-        user_message = payload.get("text", "")
-        model = payload.get("model")  # optional
+        request_id = ws_message.request_id
+        payload = ws_message.payload
+        user_message = payload.text
 
         # Check streaming configuration - FAIL FAST approach
         service_config = self.config.get("chat", {}).get("service", {})
         streaming_config = service_config.get("streaming", {})
 
-        if "streaming" in payload:
+        if payload.streaming is not None:
             # Client explicitly set streaming preference - use it
-            streaming = payload["streaming"]
+            streaming = payload.streaming
         elif streaming_config.get("enabled") is not None:
             # Use configured default - must be explicitly set
             streaming = streaming_config["enabled"]
         else:
             # FAIL FAST: No streaming configuration found
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "request_id": request_id,
-                        "status": "error",
-                        "chunk": {
-                            "error": (
-                                "Streaming configuration missing. "
-                                "Set 'chat.service.streaming.enabled' in config.yaml "
-                                "or specify 'streaming: true/false' in payload."
-                            )
-                        },
-                    }
-                )
+            await self._send_error_response(
+                websocket,
+                request_id,
+                "Streaming configuration missing. "
+                "Set 'chat.service.streaming.enabled' in config.yaml "
+                "or specify 'streaming: true/false' in payload."
             )
             return
 
         logger.info(f"Processing message with streaming={streaming}")
-
         logger.info(f"Received chat message: {user_message[:50]}...")
 
         try:
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "request_id": request_id,
-                        "status": "processing",
-                        "chunk": {"metadata": {"user_message": user_message}},
-                    }
-                )
+            # Send processing status
+            response = WebSocketResponse(
+                request_id=request_id,
+                status="processing",
+                chunk={"metadata": {"user_message": user_message}}
             )
+            await websocket.send_text(response.model_dump_json())
 
             # get or assign conversation_id
             conversation_id = self.conversation_ids.get(websocket)
@@ -201,20 +208,23 @@ class WebSocketServer:
             else:
                 # Non-streaming mode: single final assistant message
                 await self._handle_non_streaming_chat(
-                    websocket, request_id, conversation_id, user_message, model
+                    websocket, request_id, conversation_id, user_message
                 )
 
         except Exception as e:
             logger.error(f"Error processing chat message: {e}")
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "request_id": request_id,
-                        "status": "error",
-                        "chunk": {"error": str(e)},
-                    }
-                )
-            )
+            await self._send_error_response(websocket, request_id, str(e))
+
+    async def _send_error_response(
+        self, websocket: WebSocket, request_id: str, error_message: str
+    ):
+        """Send error response using Pydantic model."""
+        response = WebSocketResponse(
+            request_id=request_id,
+            status="error",
+            chunk={"error": error_message}
+        )
+        await websocket.send_text(response.model_dump_json())
 
     async def _handle_streaming_chat(
         self,
@@ -224,31 +234,19 @@ class WebSocketServer:
         user_message: str,
     ):
         """Handle streaming chat response."""
-        # Get chat history for this conversation
-        events = await self.repo.last_n_tokens(conversation_id, 4000)
-
-        # Convert to OpenAI-style history
-        history = []
-        for ev in events:
-            if ev.type in ("user_message", "assistant_message"):
-                history.append({"role": ev.role, "content": ev.content})
-
-        # Stream response chunks
+        # Stream response chunks using new signature (no external history needed)
         async for chat_message in self.chat_service.process_message(
-            user_message, history
+            conversation_id, user_message, request_id
         ):
             await self._send_chat_response(websocket, request_id, chat_message)
 
-        # Send completion signal
-        await websocket.send_text(
-            json.dumps(
-                {
-                    "request_id": request_id,
-                    "status": "complete",
-                    "chunk": {},
-                }
-            )
+        # Send completion signal using Pydantic
+        completion_response = WebSocketResponse(
+            request_id=request_id,
+            status="complete",
+            chunk={}
         )
+        await websocket.send_text(completion_response.model_dump_json())
 
     async def _handle_non_streaming_chat(
         self,
@@ -256,96 +254,81 @@ class WebSocketServer:
         request_id: str,
         conversation_id: str,
         user_message: str,
-        model: str | None,
     ):
         """Handle non-streaming chat response."""
         assistant_ev = await self.chat_service.chat_once(
             conversation_id=conversation_id,
             user_msg=user_message,
-            model=model,
             request_id=request_id,
         )
 
-        await websocket.send_text(
-            json.dumps(
-                {
-                    "request_id": request_id,
-                    "status": "chunk",
-                    "chunk": {
-                        "type": "text",
-                        "data": assistant_ev.content,
-                        "metadata": {},
-                    },
-                }
-            )
+        # Send final response using Pydantic
+        final_response = WebSocketResponse(
+            request_id=request_id,
+            status="chunk",
+            chunk={
+                "type": "text",
+                "data": assistant_ev.content,
+                "metadata": {},
+            }
         )
+        await websocket.send_text(final_response.model_dump_json())
 
-        await websocket.send_text(
-            json.dumps(
-                {
-                    "request_id": request_id,
-                    "status": "complete",
-                    "chunk": {},
-                }
-            )
+        # Send completion signal using Pydantic
+        completion_response = WebSocketResponse(
+            request_id=request_id,
+            status="complete",
+            chunk={}
         )
+        await websocket.send_text(completion_response.model_dump_json())
 
     async def _send_chat_response(
         self, websocket: WebSocket, request_id: str, chat_message
     ):
-        """Send a chat response to the frontend."""
+        """Send a chat response to the frontend using Pydantic models."""
         logger.info(
             "Sending WebSocket message: "
             f"type={chat_message.type}, "
             f"content={chat_message.content[:50]}..."
         )
 
-        # Convert chat service message to frontend format
+        # Convert chat service message to frontend format using Pydantic
         if chat_message.type == "text":
             # Only send text messages that aren't tool results
             if not chat_message.metadata.get("tool_result"):
-                await websocket.send_text(
-                    json.dumps(
-                        {
-                            "request_id": request_id,
-                            "status": "chunk",
-                            "chunk": {
-                                "type": "text",
-                                "data": chat_message.content,
-                                "metadata": chat_message.metadata,
-                            },
-                        }
-                    )
+                response = WebSocketResponse(
+                    request_id=request_id,
+                    status="chunk",
+                    chunk={
+                        "type": "text",
+                        "data": chat_message.content,
+                        "metadata": chat_message.metadata,
+                    }
                 )
+                await websocket.send_text(response.model_dump_json())
 
         elif chat_message.type == "tool_execution":
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "request_id": request_id,
-                        "status": "processing",
-                        "chunk": {
-                            "type": "tool_execution",
-                            "data": chat_message.content,
-                            "metadata": chat_message.metadata,
-                        },
-                    }
-                )
+            response = WebSocketResponse(
+                request_id=request_id,
+                status="processing",
+                chunk={
+                    "type": "tool_execution",
+                    "data": chat_message.content,
+                    "metadata": chat_message.metadata,
+                }
             )
+            await websocket.send_text(response.model_dump_json())
 
         elif chat_message.type == "error":
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "request_id": request_id,
-                        "status": "error",
-                        "chunk": {
-                            "error": chat_message.content,
-                            "metadata": chat_message.metadata,
-                        },
-                    }
-                )
+            response = WebSocketResponse(
+                request_id=request_id,
+                status="error",
+                chunk={
+                    "error": chat_message.content,
+                    "metadata": chat_message.metadata,
+                }
             )
+            await websocket.send_text(response.model_dump_json())
 
     async def _connect_websocket(self, websocket: WebSocket):
         """Connect a WebSocket."""

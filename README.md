@@ -11,9 +11,26 @@ uv sync
 # Set API key
 export GROQ_API_KEY="your_key_here"
 
+# Run system tests (optional but recommended)
+./run_tests.sh
+
 # Run the platform
 ./run.sh
 ```
+
+## 🧪 Testing
+
+Run the comprehensive system test to verify everything is working:
+
+```bash
+./run_tests.sh
+```
+
+This tests:
+- ChatEvent model and sequence assignment
+- Prompt history filtering (only `user_message`, `assistant_message`, `tool_result`, and flagged `system_update` events)
+- InMemory and JSONL repository implementations  
+- Delta compaction and token counting
 
 ## 📡 WebSocket API
 

@@ -17,8 +17,10 @@ from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any
 
 from mcp import types
+from pydantic import BaseModel, Field
 
 from src.history.chat_store import ChatEvent, ChatRepository, Usage
+from src.history.conversation_utils import build_conversation_with_token_limit
 
 if TYPE_CHECKING:
     from src.main import LLMClient, MCPClient
@@ -32,18 +34,24 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_HOPS = 8
 
 
-class ChatMessage:
+class ToolCallContext(BaseModel):
+    """Parameters for tool call iteration handling."""
+    conv: list[dict[str, Any]]
+    tools_payload: list[dict[str, Any]]
+    conversation_id: str
+    request_id: str
+    assistant_msg: dict[str, Any]
+    full_content: str
+
+
+class ChatMessage(BaseModel):
     """
     Represents a chat message with metadata.
+    Pydantic model for proper validation and serialization.
     """
-
-    def __init__(
-        self, mtype: str, content: str, meta: dict[str, Any] | None = None
-    ):
-        self.type = mtype
-        self.content = content
-        self.meta = meta or {}
-        self.metadata = self.meta
+    type: str
+    content: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ChatService:
@@ -72,6 +80,7 @@ class ChatService:
         self.tool_mgr: ToolSchemaManager | None = None
         self._init_lock = asyncio.Lock()
         self._ready = asyncio.Event()
+        self._resource_catalog: list[str] = []  # Initialize resource catalog
 
     async def initialize(self) -> None:
         """Initialize the chat service and all MCP clients."""
@@ -131,102 +140,256 @@ class ChatService:
 
     async def process_message(
         self,
+        conversation_id: str,
         user_msg: str,
-        history: list[dict[str, Any]],
+        request_id: str,
     ) -> AsyncGenerator[ChatMessage]:
         """
-        Process a user message and yield response chunks.
-        REQUIRES streaming LLM client.
+        Process a user message with consistent history management and delta persistence.
+
+        Flow:
+        1. Persist user message first (with idempotency check)
+        2. Build history from repository
+        3. Stream response while persisting deltas
+        4. Compact deltas into final assistant message
         """
         await self._ready.wait()
+        self._validate_streaming_support()
 
+        # Handle idempotency and user message persistence
+        should_continue = await self._handle_user_message_persistence(
+            conversation_id, user_msg, request_id
+        )
+        if not should_continue:
+            async for msg in self._yield_existing_response(conversation_id, request_id):
+                yield msg
+            return
+
+        # Build conversation and generate response
+        conv = await self._build_conversation_history(conversation_id, user_msg)
+
+        # Type assertion: tool_mgr is guaranteed non-None after validation
+        assert self.tool_mgr is not None
+        tools_payload = self.tool_mgr.get_openai_tools()
+
+        # Stream and handle tool calls
+        async for msg in self._stream_and_handle_tools(
+            conv, tools_payload, conversation_id, request_id
+        ):
+            yield msg
+
+    def _validate_streaming_support(self) -> None:
+        """Validate that streaming is supported."""
         if not self.tool_mgr:
             raise RuntimeError("Tool manager not initialized")
 
-        # FAIL FAST: Ensure LLM client supports streaming
         if not hasattr(self.llm_client, 'get_streaming_response_with_tools'):
             raise RuntimeError(
                 "LLM client does not support streaming. "
                 "Use chat_once() for non-streaming responses."
             )
 
-        conv = [
-            {"role": "system", "content": self._system_prompt},
-            *history,
-            {"role": "user", "content": user_msg},
-        ]
+    async def _handle_user_message_persistence(
+        self, conversation_id: str, user_msg: str, request_id: str
+    ) -> bool:
+        """
+        Handle user message persistence with idempotency check.
+        Returns True if processing should continue, False if response already exists.
+        """
+        # Check for existing response first
+        existing_response = await self._get_existing_assistant_response(
+            conversation_id, request_id
+        )
+        if existing_response:
+            logger.info(f"Returning cached response for request_id: {request_id}")
+            return False
 
-        tools_payload = self.tool_mgr.get_openai_tools()
+        # Persist user message
+        user_ev = ChatEvent(
+            conversation_id=conversation_id,
+            seq=0,  # Will be assigned by repository
+            type="user_message",
+            role="user",
+            content=user_msg,
+            extra={"request_id": request_id},
+        )
+        user_ev.compute_and_cache_tokens()
+        was_added = await self.repo.add_event(user_ev)
 
-        # Initial response - stream and collect
+        if not was_added:
+            # Check for existing response again after duplicate detection
+            existing_response = await self._get_existing_assistant_response(
+                conversation_id, request_id
+            )
+            if existing_response:
+                logger.info(
+                    "Returning existing response for duplicate "
+                    f"request_id: {request_id}"
+                )
+                return False
+
+        return True
+
+    async def _yield_existing_response(
+        self, conversation_id: str, request_id: str
+    ) -> AsyncGenerator[ChatMessage]:
+        """Yield existing response content as ChatMessage."""
+        existing_response = await self._get_existing_assistant_response(
+            conversation_id, request_id
+        )
+        if existing_response and existing_response.content:
+            content_str = (
+                existing_response.content
+                if isinstance(existing_response.content, str)
+                else str(existing_response.content)
+            )
+            yield ChatMessage(
+                type="text",
+                content=content_str,
+                metadata={"cached": True}
+            )
+
+    async def _build_conversation_history(
+        self, conversation_id: str, user_msg: str
+    ) -> list[dict[str, Any]]:
+        """Build conversation history from repository."""
+        events = await self.repo.last_n_tokens(conversation_id, self.ctx_window)
+        conv, _ = build_conversation_with_token_limit(
+            self._system_prompt,
+            events,
+            user_msg,
+            self.ctx_window,
+            500  # reserve tokens
+        )
+        return conv
+
+    async def _stream_and_handle_tools(
+        self,
+        conv: list[dict[str, Any]],
+        tools_payload: list[dict[str, Any]],
+        conversation_id: str,
+        request_id: str,
+    ) -> AsyncGenerator[ChatMessage]:
+        """Stream response and handle tool calls iteratively."""
+        full_content = ""
+
+        # Initial response streaming
         assistant_msg: dict[str, Any] = {}
-        async for chunk in self._stream_llm_response(conv, tools_payload):
+        async for chunk in self._stream_llm_response_with_deltas(
+            conv, tools_payload, conversation_id, request_id
+        ):
             if isinstance(chunk, ChatMessage):
+                if chunk.type == "text":
+                    full_content += chunk.content
                 yield chunk
             else:
                 assistant_msg = chunk
+                if assistant_msg.get("content"):
+                    full_content += assistant_msg["content"]
 
-        # Log LLM reply if configured
+        self._log_initial_response(assistant_msg)
+
+        # Handle tool call iterations
+        context = ToolCallContext(
+            conv=conv,
+            tools_payload=tools_payload,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            assistant_msg=assistant_msg,
+            full_content=full_content
+        )
+        async for msg in self._handle_tool_call_iterations(context):
+            if isinstance(msg, str):
+                full_content = msg  # Updated full content
+            else:
+                yield msg
+
+        # Final compaction
+        await self.repo.compact_deltas(
+            conversation_id,
+            request_id,
+            full_content,
+            usage=self._convert_usage(None),
+            model=self.llm_client.config.get("model", "")
+        )
+
+    def _log_initial_response(self, assistant_msg: dict[str, Any]) -> None:
+        """Log initial LLM response if configured."""
         reply_data = {
             "message": assistant_msg,
-            "usage": None,  # Usage not available in streaming mode
+            "usage": None,
             "model": self.llm_client.config.get("model", "")
         }
         self._log_llm_reply(reply_data, "Streaming initial response")
 
-        # Handle tool calls in a loop
+    async def _handle_tool_call_iterations(
+        self, context: ToolCallContext
+    ) -> AsyncGenerator[ChatMessage | str]:
+        """Handle iterative tool calls with hop limit."""
         hops = 0
-        while calls := assistant_msg.get("tool_calls"):
+
+        while context.assistant_msg.get("tool_calls"):
             if hops >= MAX_TOOL_HOPS:
-                logger.warning(
-                    f"Maximum tool hops ({MAX_TOOL_HOPS}) reached, stopping recursion"
-                )
-                yield ChatMessage(
-                    "text",
+                warning_msg = (
                     f"⚠️ Reached maximum tool call limit ({MAX_TOOL_HOPS}). "
-                    "Stopping to prevent infinite recursion.",
-                    {"finish_reason": "tool_limit_reached"},
+                    "Stopping to prevent infinite recursion."
+                )
+                logger.warning(f"Maximum tool hops ({MAX_TOOL_HOPS}) reached, stopping")
+                context.full_content += "\n\n" + warning_msg
+                yield ChatMessage(
+                    type="text",
+                    content=warning_msg,
+                    metadata={"finish_reason": "tool_limit_reached"}
                 )
                 break
 
-            # Add assistant message to conversation
-            conv.append(
-                {
-                    "role": "assistant",
-                    "content": assistant_msg.get("content") or "",
-                    "tool_calls": calls,
-                }
+            # Execute tool calls
+            context.conv.append({
+                "role": "assistant",
+                "content": context.assistant_msg.get("content") or "",
+                "tool_calls": context.assistant_msg["tool_calls"],
+            })
+            await self._execute_tool_calls(
+                context.conv, context.assistant_msg["tool_calls"]
             )
 
-            # Execute tool calls
-            await self._execute_tool_calls(conv, calls)
-
-            # Get follow-up response - stream and collect
-            assistant_msg = {}
-            async for chunk in self._stream_llm_response(conv, tools_payload):
+            # Get follow-up response
+            context.assistant_msg = {}
+            async for chunk in self._stream_llm_response_with_deltas(
+                context.conv, context.tools_payload, context.conversation_id,
+                context.request_id, hop_number=hops + 1
+            ):
                 if isinstance(chunk, ChatMessage):
+                    if chunk.type == "text":
+                        context.full_content += chunk.content
                     yield chunk
                 else:
-                    assistant_msg = chunk
-
-            # Log LLM reply if configured
-            reply_data = {
-                "message": assistant_msg,
-                "usage": None,  # Usage not available in streaming mode
-                "model": self.llm_client.config.get("model", "")
-            }
-            context = f"Streaming tool follow-up (hop {hops + 1})"
-            self._log_llm_reply(reply_data, context)
+                    context.assistant_msg = chunk
+                    if context.assistant_msg.get("content"):
+                        context.full_content += context.assistant_msg["content"]
 
             hops += 1
 
-    async def _stream_llm_response(
-        self, conv: list[dict[str, Any]], tools_payload: list[dict[str, Any]]
+        yield context.full_content  # Return updated full_content
+
+    async def _stream_llm_response_with_deltas(
+        self,
+        conv: list[dict[str, Any]],
+        tools_payload: list[dict[str, Any]],
+        conversation_id: str,
+        user_request_id: str,
+        hop_number: int = 0
     ) -> AsyncGenerator[ChatMessage | dict[str, Any]]:
-        """Stream response from LLM and yield chunks to user."""
+        """
+        Stream response from LLM, persist deltas, and yield chunks to user.
+
+        Key behavior: Message content streams immediately to user while tool calls
+        are accumulated in the background for efficient execution.
+        """
         message_buffer = ""
         current_tool_calls: list[dict[str, Any]] = []
         finish_reason: str | None = None
+        delta_index = 0
 
         async for chunk in self.llm_client.get_streaming_response_with_tools(
             conv, tools_payload
@@ -237,18 +400,51 @@ class ChatService:
             choice = chunk["choices"][0]
             delta = choice.get("delta", {})
 
-            # Handle content streaming
+            # Handle content streaming - IMMEDIATE yield to user
             if content := delta.get("content"):
                 message_buffer += content
-                yield ChatMessage("text", content, {"type": "delta"})
 
-            # Handle tool calls streaming
+                # Persist delta event for history
+                delta_event = ChatEvent(
+                    conversation_id=conversation_id,
+                    seq=0,  # Will be assigned by repository
+                    type="meta",
+                    content=content,
+                    extra={
+                        "kind": "assistant_delta",
+                        "user_request_id": user_request_id,
+                        "hop_number": hop_number,
+                        "delta_index": delta_index,
+                        "request_id": user_request_id  # Add for easier queries
+                    }
+                )
+                await self.repo.add_event(delta_event)
+                delta_index += 1
+
+                # Stream to user immediately - no waiting!
+                yield ChatMessage(
+                    type="text",
+                    content=content,
+                    metadata={"type": "delta", "hop": hop_number}
+                )
+
+            # Handle tool calls streaming - accumulate for later execution
             if tool_calls := delta.get("tool_calls"):
                 self._accumulate_tool_calls(current_tool_calls, tool_calls)
 
             # Handle finish reason
             if "finish_reason" in choice:
                 finish_reason = choice["finish_reason"]
+
+        # Send tool execution status if tools were called
+        if current_tool_calls and any(
+            call["function"]["name"] for call in current_tool_calls
+        ):
+            yield ChatMessage(
+                type="tool_execution",
+                content=f"Executing {len(current_tool_calls)} tool(s)...",
+                metadata={"tool_count": len(current_tool_calls), "hop": hop_number}
+            )
 
         # Yield complete assistant message as final item
         yield {
@@ -278,11 +474,20 @@ class ChatService:
             if "function" in tool_call:
                 func = tool_call["function"]
                 if "name" in func:
-                    current_tool_calls[idx]["function"]["name"] += func["name"]
+                    # Use list-based accumulation to handle out-of-order deltas
+                    if "name_parts" not in current_tool_calls[idx]["function"]:
+                        current_tool_calls[idx]["function"]["name_parts"] = []
+                    current_tool_calls[idx]["function"]["name_parts"].append(func["name"])
+                    current_tool_calls[idx]["function"]["name"] = "".join(
+                        current_tool_calls[idx]["function"]["name_parts"]
+                    )
                 if "arguments" in func:
-                    call_args = current_tool_calls[idx]["function"]["arguments"]
-                    current_tool_calls[idx]["function"]["arguments"] = (
-                        call_args + func["arguments"]
+                    # Use list-based accumulation for arguments too
+                    if "args_parts" not in current_tool_calls[idx]["function"]:
+                        current_tool_calls[idx]["function"]["args_parts"] = []
+                    current_tool_calls[idx]["function"]["args_parts"].append(func["arguments"])
+                    current_tool_calls[idx]["function"]["arguments"] = "".join(
+                        current_tool_calls[idx]["function"]["args_parts"]
                     )
 
     async def _execute_tool_calls(
@@ -327,9 +532,16 @@ class ChatService:
         conversation_id: str,
         user_msg: str,
         request_id: str,
-        model: str | None = None,
     ) -> ChatEvent:
-        """Non-streaming: persist user msg first, call LLM once, persist assistant."""
+        """
+        Non-streaming chat with consistent history management.
+        
+        Flow:
+        1. Persist user message first (with idempotency check)
+        2. Build history from repository
+        3. Generate response with tools
+        4. Persist final assistant message
+        """  # noqa: W293
         await self._ready.wait()
 
         if not self.tool_mgr:
@@ -348,6 +560,7 @@ class ChatService:
         # 1) persist user message FIRST with idempotency check
         user_ev = ChatEvent(
             conversation_id=conversation_id,
+            seq=0,  # Will be assigned by repository
             type="user_message",
             role="user",
             content=user_msg,
@@ -372,16 +585,13 @@ class ChatService:
 
         # 2) build canonical history from repo
         events = await self.repo.last_n_tokens(conversation_id, self.ctx_window)
-
-        # 3) convert to OpenAI-style list for your LLM call
-        conv: list[dict[str, Any]] = [
-            {"role": "system", "content": self._system_prompt},
-        ]
-        for ev in events:
-            if ev.type in ("user_message", "assistant_message", "system_update"):
-                conv.append({"role": ev.role, "content": ev.content})
-
-        conv.append({"role": "user", "content": user_msg})
+        conv, _ = build_conversation_with_token_limit(
+            self._system_prompt,
+            events,
+            user_msg,
+            self.ctx_window,
+            500  # reserve tokens
+        )
 
         # 4) Generate assistant response with usage tracking
         (
@@ -393,11 +603,12 @@ class ChatService:
         # 5) persist assistant message with usage and reference to user request
         assistant_ev = ChatEvent(
             conversation_id=conversation_id,
+            seq=0,  # Will be assigned by repository
             type="assistant_message",
             role="assistant",
             content=assistant_full_text,
             usage=total_usage,
-            provider="openai",  # or map from llm_client/config
+            provider=self.llm_client.config.get("provider", "unknown"),
             model=model,
             extra={"user_request_id": request_id},
         )
@@ -507,7 +718,8 @@ class ChatService:
 
     def _log_llm_reply(self, reply: dict[str, Any], context: str) -> None:
         """Log LLM reply if configured."""
-        if not self.chat_conf.get("logging", {}).get("llm_replies", False):
+        logging_config = self.chat_conf.get("logging", {})
+        if not logging_config.get("llm_replies", False):
             return
 
         message = reply.get("message", {})
@@ -515,7 +727,6 @@ class ChatService:
         tool_calls = message.get("tool_calls", [])
 
         # Truncate content if configured
-        logging_config = self.chat_conf.get("logging", {})
         truncate_length = logging_config.get("llm_reply_truncate_length", 500)
         if content and len(content) > truncate_length:
             content = content[:truncate_length] + "..."

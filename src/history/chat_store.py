@@ -31,7 +31,9 @@ The module follows the MCP Platform's standards with:
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
+import logging
 import os
 import threading
 import uuid
@@ -42,6 +44,8 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, Field
 
 from src.history.token_counter import estimate_tokens
+
+logger = logging.getLogger(__name__)
 
 # ---------- Canonical models (Pydantic v2) ----------
 
@@ -66,6 +70,8 @@ class Usage(BaseModel):
 class ChatEvent(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     conversation_id: str
+    # sequence must always be filled by the repo; start with None
+    seq: int | None = None
     schema_version: int = 1
     type: Literal[
         "user_message",
@@ -116,6 +122,17 @@ class ChatEvent(BaseModel):
 
 # ---------- Repository interface ----------
 
+# -------------------------------------------------------------------
+# Prompt-history filter (hybrid = semantic + tool_result + flagged system)
+# -------------------------------------------------------------------
+_CONTEXT_TYPES = {"user_message", "assistant_message", "tool_result"}
+
+def _visible_to_llm(ev: ChatEvent) -> bool:
+    if ev.type in _CONTEXT_TYPES:
+        return True
+    # allow system updates only when you mark them
+    return ev.type == "system_update" and ev.extra.get("visible_to_model", False)
+
 class ChatRepository(Protocol):
     # Returns True if added, False if duplicate
     async def add_event(self, event: ChatEvent) -> bool: ...
@@ -132,26 +149,49 @@ class ChatRepository(Protocol):
     async def get_last_assistant_reply_id(
         self, conversation_id: str, user_request_id: str
     ) -> str | None: ...
+    async def compact_deltas(
+        self, conversation_id: str, user_request_id: str, final_content: str,
+        usage: Usage | None = None, model: str | None = None
+    ) -> ChatEvent: ...
 
 # ---------- In-memory implementation ----------
 
 class InMemoryRepo(ChatRepository):
     def __init__(self):
         self._by_conv: dict[str, list[ChatEvent]] = {}
+        self._seq_counters: dict[str, int] = {}  # Per-conversation sequence counters
+        self._req_ids: dict[str, set[str]] = {}  # Per-conversation fast request_id sets
+        # conv_id -> {user_req_id -> asst_id}
+        self._last_assistant_ids: dict[str, dict[str, str]] = {}
         self._lock = threading.Lock()
+
+    def _get_next_seq(self, conversation_id: str) -> int:
+        """Get next sequence number for conversation. Must be called with lock held."""
+        current = self._seq_counters.get(conversation_id, 0)
+        next_seq = current + 1
+        self._seq_counters[conversation_id] = next_seq
+        return next_seq
 
     async def add_event(self, event: ChatEvent) -> bool:
         with self._lock:
             events = self._by_conv.setdefault(event.conversation_id, [])
 
-            # Check for duplicate by request_id if present
+            # Check for duplicate by request_id if present - O(1) lookup
             request_id = event.extra.get("request_id")
             if request_id:
-                for existing_event in events:
-                    if existing_event.extra.get("request_id") == request_id:
-                        return False  # Duplicate found, don't add
+                req_ids = self._req_ids.setdefault(event.conversation_id, set())
+                if request_id in req_ids:
+                    return False  # Duplicate found, don't add
 
+            # Assign sequence number atomically (always overwrite)
+            event.seq = self._get_next_seq(event.conversation_id)
             events.append(event)
+
+            # Add request_id to fast lookup set
+            if request_id:
+                req_ids = self._req_ids.setdefault(event.conversation_id, set())
+                req_ids.add(request_id)
+
             return True  # Successfully added
 
     async def get_events(
@@ -166,9 +206,11 @@ class InMemoryRepo(ChatRepository):
     ) -> list[ChatEvent]:
         with self._lock:
             events = self._by_conv.get(conversation_id, [])
+            conversation_events = [ev for ev in events if _visible_to_llm(ev)]
+
             acc: list[ChatEvent] = []
             total = 0
-            for ev in reversed(events):
+            for ev in reversed(conversation_events):
                 # Ensure token count is computed
                 tok = ev.ensure_token_count()
                 if total + tok > max_tokens:
@@ -195,14 +237,70 @@ class InMemoryRepo(ChatRepository):
         self, conversation_id: str, user_request_id: str
     ) -> str | None:
         with self._lock:
+            # O(1) lookup using cached IDs
+            conv_cache = self._last_assistant_ids.get(conversation_id, {})
+            return conv_cache.get(user_request_id)
+
+    async def compact_deltas(
+        self, conversation_id: str, user_request_id: str, final_content: str,
+        usage: Usage | None = None, model: str | None = None
+    ) -> ChatEvent:
+        """Compact delta events into a single assistant_message and remove deltas."""
+        with self._lock:
             events = self._by_conv.get(conversation_id, [])
-            for event in reversed(events):
+
+            # Check if assistant message already exists for this user_request_id
+            req_ids = self._req_ids.setdefault(conversation_id, set())
+            assistant_req_id = f"assistant:{user_request_id}"
+            if assistant_req_id in req_ids:
+                # Find and return existing assistant message
+                for event in events:
+                    if (event.type == "assistant_message" and
+                        event.extra.get("user_request_id") == user_request_id):
+                        return event
+                # Fallback if not found (shouldn't happen)
+                logger.warning(
+                    f"Assistant request_id {assistant_req_id} in set "
+                    f"but event not found"
+                )
+
+            # Find and remove delta events for this user request
+            deltas_to_remove = []
+            for i, event in enumerate(events):
                 if (
-                    event.type == "assistant_message"
+                    event.type == "meta"
+                    and event.extra.get("kind") == "assistant_delta"
                     and event.extra.get("user_request_id") == user_request_id
                 ):
-                    return event.id
-            return None
+                    deltas_to_remove.append(i)
+
+            # Remove deltas in reverse order to maintain indices
+            for i in reversed(deltas_to_remove):
+                events.pop(i)
+
+            # Create final assistant message
+            assistant_event = ChatEvent(
+                conversation_id=conversation_id,
+                type="assistant_message",
+                role="assistant",
+                content=final_content,
+                usage=usage,
+                model=model,
+                extra={"user_request_id": user_request_id}
+            )
+            assistant_event.seq = self._get_next_seq(conversation_id)
+            assistant_event.compute_and_cache_tokens()
+
+            events.append(assistant_event)
+
+            # Add to request_id set to prevent duplicate compaction
+            req_ids.add(assistant_req_id)
+
+            # Cache assistant ID for O(1) lookup
+            asst_cache = self._last_assistant_ids.setdefault(conversation_id, {})
+            asst_cache[user_request_id] = assistant_event.id
+
+            return assistant_event
 
 # ---------- JSONL (append-only) implementation ----------
 
@@ -215,6 +313,10 @@ class JsonlRepo(ChatRepository):
         self.path = path
         self._lock = threading.Lock()
         self._by_conv: dict[str, list[ChatEvent]] = {}
+        self._seq_counters: dict[str, int] = {}  # Per-conversation sequence counters
+        self._req_ids: dict[str, set[str]] = {}  # Per-conversation fast request_id sets
+        # conv_id -> {user_req_id -> asst_id}
+        self._last_assistant_ids: dict[str, dict[str, str]] = {}
         self._load()
 
     def _load(self) -> None:
@@ -229,27 +331,67 @@ class JsonlRepo(ChatRepository):
                 ev = ChatEvent.model_validate(data)
                 self._by_conv.setdefault(ev.conversation_id, []).append(ev)
 
+                # Track highest sequence number per conversation
+                if ev.seq is not None:
+                    current_max = self._seq_counters.get(ev.conversation_id, 0)
+                    self._seq_counters[ev.conversation_id] = max(current_max, ev.seq)
+
+                # Build request_id sets for O(1) duplicate detection
+                request_id = ev.extra.get("request_id")
+                if request_id:
+                    req_ids = self._req_ids.setdefault(ev.conversation_id, set())
+                    req_ids.add(request_id)
+
+                # Cache assistant IDs for O(1) lookup
+                if (ev.type == "assistant_message" and
+                    ev.extra.get("user_request_id")):
+                    conv_id = ev.conversation_id
+                    asst_cache = self._last_assistant_ids.setdefault(conv_id, {})
+                    asst_cache[ev.extra["user_request_id"]] = ev.id
+
+    def _get_next_seq(self, conversation_id: str) -> int:
+        """Get next sequence number for conversation. Must be called with lock held."""
+        current = self._seq_counters.get(conversation_id, 0)
+        next_seq = current + 1
+        self._seq_counters[conversation_id] = next_seq
+        return next_seq
+
     def _append_sync(self, event: ChatEvent) -> None:
         with open(self.path, "a", encoding="utf-8") as f:
-            data = json.dumps(
-                event.model_dump(mode="json"), ensure_ascii=False
-            )
-            f.write(data + "\n")
-            f.flush()
+            # Add file locking for cross-process safety
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                data = json.dumps(
+                    event.model_dump(mode="json"), ensure_ascii=False
+                )
+                f.write(data + "\n")
+                f.flush()
+                # Add fsync for crash-safety (optional but recommended for durability)
+                os.fsync(f.fileno())
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
     def _add_event_sync(self, event: ChatEvent) -> bool:
         with self._lock:
             events = self._by_conv.setdefault(event.conversation_id, [])
 
-            # Check for duplicate by request_id if present
+            # Check for duplicate by request_id if present - O(1) lookup
             request_id = event.extra.get("request_id")
             if request_id:
-                for existing_event in events:
-                    if existing_event.extra.get("request_id") == request_id:
-                        return False  # Duplicate found, don't add
+                req_ids = self._req_ids.setdefault(event.conversation_id, set())
+                if request_id in req_ids:
+                    return False  # Duplicate found, don't add
 
+            # Assign sequence number atomically (always overwrite)
+            event.seq = self._get_next_seq(event.conversation_id)
             events.append(event)
             self._append_sync(event)
+
+            # Add request_id to fast lookup set
+            if request_id:
+                req_ids = self._req_ids.setdefault(event.conversation_id, set())
+                req_ids.add(request_id)
+
             return True  # Successfully added
 
     async def add_event(self, event: ChatEvent) -> bool:
@@ -268,9 +410,11 @@ class JsonlRepo(ChatRepository):
     ) -> list[ChatEvent]:
         with self._lock:
             events = self._by_conv.get(conversation_id, [])
+            conversation_events = [ev for ev in events if _visible_to_llm(ev)]
+
             acc: list[ChatEvent] = []
             total = 0
-            for ev in reversed(events):
+            for ev in reversed(conversation_events):
                 # Ensure token count is computed
                 tok = ev.ensure_token_count()
                 if total + tok > max_tokens:
@@ -297,14 +441,85 @@ class JsonlRepo(ChatRepository):
         self, conversation_id: str, user_request_id: str
     ) -> str | None:
         with self._lock:
+            # O(1) lookup using cached IDs
+            conv_cache = self._last_assistant_ids.get(conversation_id, {})
+            return conv_cache.get(user_request_id)
+
+    def _compact_deltas_sync(
+        self, conversation_id: str, user_request_id: str, final_content: str,
+        usage: Usage | None = None, model: str | None = None
+    ) -> ChatEvent:
+        """Synchronous delta compaction. Must be called with executor."""
+        with self._lock:
             events = self._by_conv.get(conversation_id, [])
-            for event in reversed(events):
+
+            # Check if assistant message already exists for this user_request_id
+            req_ids = self._req_ids.setdefault(conversation_id, set())
+            assistant_req_id = f"assistant:{user_request_id}"
+            if assistant_req_id in req_ids:
+                # Find and return existing assistant message
+                for event in events:
+                    if (event.type == "assistant_message" and
+                        event.extra.get("user_request_id") == user_request_id):
+                        return event
+                # Fallback if not found (shouldn't happen)
+                logger.warning(
+                    f"Assistant request_id {assistant_req_id} in set "
+                    f"but event not found"
+                )
+
+            # Find and remove delta events for this user request
+            deltas_to_remove = []
+            for i, event in enumerate(events):
                 if (
-                    event.type == "assistant_message"
+                    event.type == "meta"
+                    and event.extra.get("kind") == "assistant_delta"
                     and event.extra.get("user_request_id") == user_request_id
                 ):
-                    return event.id
-            return None
+                    deltas_to_remove.append(i)
+
+            # Remove deltas in reverse order to maintain indices
+            for i in reversed(deltas_to_remove):
+                events.pop(i)
+
+            # Create final assistant message
+            assistant_event = ChatEvent(
+                conversation_id=conversation_id,
+                type="assistant_message",
+                role="assistant",
+                content=final_content,
+                usage=usage,
+                model=model,
+                extra={"user_request_id": user_request_id}
+            )
+            assistant_event.seq = self._get_next_seq(conversation_id)
+            assistant_event.compute_and_cache_tokens()
+
+            events.append(assistant_event)
+            self._append_sync(assistant_event)
+
+            # Add to request_id set to prevent duplicate compaction
+            req_ids.add(assistant_req_id)
+
+            # Cache assistant ID for O(1) lookup
+            asst_cache = self._last_assistant_ids.setdefault(conversation_id, {})
+            asst_cache[user_request_id] = assistant_event.id
+
+            return assistant_event
+
+    async def compact_deltas(
+        self, conversation_id: str, user_request_id: str, final_content: str,
+        usage: Usage | None = None, model: str | None = None
+    ) -> ChatEvent:
+        """Compact delta events into a single assistant_message and remove deltas."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            partial(
+                self._compact_deltas_sync,
+                conversation_id, user_request_id, final_content, usage, model
+            )
+        )
 
 # ---------- Tiny demo ----------
 
@@ -323,8 +538,8 @@ if __name__ == "__main__":
             type="user_message",
             role="user",
             content="Hello!",
-            token_count=2
         )
+        user_ev.compute_and_cache_tokens()
         await repo.add_event(user_ev)
 
         asst_ev = ChatEvent(
@@ -332,15 +547,15 @@ if __name__ == "__main__":
             type="assistant_message",
             role="assistant",
             content="Hi! How can I help?",
-            token_count=5,
-            provider="openai",
-            model="gpt-4o-mini"
+            provider="test_provider",
+            model="test-model"
         )
+        asst_ev.compute_and_cache_tokens()
         await repo.add_event(asst_ev)
 
         logger.info(f"Conversation ID: {conv_id}")
         events = await repo.get_events(conv_id)
         for ev in events:
-            logger.info(f"- {ev.type} {ev.role} {ev.content}")
+            logger.info(f"- seq={ev.seq} {ev.type} {ev.role} {ev.content}")
 
     asyncio.run(main())
