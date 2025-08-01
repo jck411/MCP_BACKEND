@@ -29,6 +29,30 @@ chat:
       type: "jsonl"  # Options: "jsonl", "async_jsonl", "memory"
       path: "events.jsonl"  # File path for file-based repositories
 
+    # Context management configuration
+    context:
+      # Maximum context window size in tokens
+      max_tokens: 4000
+      
+      # Tokens to reserve for LLM response generation
+      reserve_tokens: 500
+      
+      # Conversation length thresholds for response estimation
+      conversation_limits:
+        short: 100     # Short conversation threshold
+        medium: 500    # Medium conversation threshold  
+        long: 1500     # Long conversation threshold
+      
+      # Expected response token counts by conversation length
+      response_tokens:
+        short: 150     # Expected tokens for short responses
+        medium: 300    # Expected tokens for medium responses
+        long: 500      # Expected tokens for long responses
+        max: 800       # Maximum response tokens for very long conversations
+      
+      # Conversation optimization settings
+      preserve_recent: 5  # Number of recent messages to always preserve
+
     # Streaming configuration
     streaming:
       enabled: true  # Enable streaming by default (required setting)

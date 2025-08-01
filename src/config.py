@@ -183,3 +183,79 @@ class Configuration:
             "connection_timeout": connection_timeout,
             "ping_timeout": ping_timeout,
         }
+
+    def get_context_config(self) -> dict[str, Any]:
+        """Get context management configuration from YAML.
+
+        Returns:
+            Context configuration dictionary with validated defaults.
+        """
+        service_config = self.get_chat_service_config()
+        context_config = service_config.get("context", {})
+
+        # Get values with defaults
+        max_tokens = context_config.get("max_tokens", 4000)
+        reserve_tokens = context_config.get("reserve_tokens", 500)
+
+        # Conversation limits
+        limits = context_config.get("conversation_limits", {})
+        short_limit = limits.get("short", 100)
+        medium_limit = limits.get("medium", 500)
+        long_limit = limits.get("long", 1500)
+
+        # Response token estimates
+        response_tokens = context_config.get("response_tokens", {})
+        short_response = response_tokens.get("short", 150)
+        medium_response = response_tokens.get("medium", 300)
+        long_response = response_tokens.get("long", 500)
+        max_response = response_tokens.get("max", 800)
+
+        # Optimization settings
+        preserve_recent = context_config.get("preserve_recent", 5)
+
+        # Validate configuration values
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be at least 1")
+        if reserve_tokens < 0:
+            raise ValueError("reserve_tokens must be non-negative")
+        if not (short_limit < medium_limit < long_limit):
+            raise ValueError("conversation_limits must be in ascending order")
+        if not (short_response <= medium_response <= long_response <= max_response):
+            raise ValueError("response_tokens must be in non-decreasing order")
+        if preserve_recent < 0:
+            raise ValueError("preserve_recent must be non-negative")
+
+        return {
+            "max_tokens": max_tokens,
+            "reserve_tokens": reserve_tokens,
+            "conversation_limits": {
+                "short": short_limit,
+                "medium": medium_limit,
+                "long": long_limit,
+            },
+            "response_tokens": {
+                "short": short_response,
+                "medium": medium_response,
+                "long": long_response,
+                "max": max_response,
+            },
+            "preserve_recent": preserve_recent,
+        }
+
+    def get_streaming_config(self) -> dict[str, Any]:
+        """Get streaming configuration from YAML.
+
+        Returns:
+            Streaming configuration dictionary.
+        """
+        service_config = self.get_chat_service_config()
+        return service_config.get("streaming", {})
+
+    def get_tool_notifications_config(self) -> dict[str, Any]:
+        """Get tool notification configuration from YAML.
+
+        Returns:
+            Tool notification configuration dictionary.
+        """
+        service_config = self.get_chat_service_config()
+        return service_config.get("tool_notifications", {})

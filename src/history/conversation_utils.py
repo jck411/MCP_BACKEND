@@ -15,23 +15,13 @@ from src.history.token_counter import count_conversation_tokens
 
 logger = logging.getLogger(__name__)
 
-# Constants for response size estimation
-SHORT_CONVERSATION_LIMIT = 100
-MEDIUM_CONVERSATION_LIMIT = 500
-LONG_CONVERSATION_LIMIT = 1500
-
-SHORT_RESPONSE_TOKENS = 150
-MEDIUM_RESPONSE_TOKENS = 300
-LONG_RESPONSE_TOKENS = 500
-MAX_RESPONSE_TOKENS = 800
-
 
 def build_conversation_with_token_limit(
     system_prompt: str,
     events: list[ChatEvent],
     user_message: str,
     max_tokens: int,
-    reserve_tokens: int = 500,
+    reserve_tokens: int,
 ) -> tuple[list[dict[str, Any]], int]:
     """
     Build a conversation list with token limit enforcement.
@@ -114,22 +104,31 @@ def build_conversation_with_token_limit(
     return conversation, final_tokens
 
 
-def estimate_response_tokens(conversation: list[dict[str, Any]]) -> int:
+def estimate_response_tokens(
+    conversation: list[dict[str, Any]],
+    conversation_limits: dict[str, int],
+    response_tokens: dict[str, int],
+) -> int:
     """
     Estimate how many tokens a response might need based on conversation.
 
     This is a heuristic based on typical response patterns.
+
+    Args:
+        conversation: The conversation to analyze
+        conversation_limits: Dict with 'short', 'medium', 'long' limits
+        response_tokens: Dict with 'short', 'medium', 'long', 'max' token counts
     """
     conversation_tokens = count_conversation_tokens(conversation)
 
-    # Heuristics for response size
-    if conversation_tokens < SHORT_CONVERSATION_LIMIT:
-        return SHORT_RESPONSE_TOKENS  # Short responses for short conversations
-    if conversation_tokens < MEDIUM_CONVERSATION_LIMIT:
-        return MEDIUM_RESPONSE_TOKENS  # Medium responses
-    if conversation_tokens < LONG_CONVERSATION_LIMIT:
-        return LONG_RESPONSE_TOKENS  # Longer responses for complex conversations
-    return MAX_RESPONSE_TOKENS  # Max response for very long conversations
+    # Heuristics for response size based on configuration
+    if conversation_tokens < conversation_limits["short"]:
+        return response_tokens["short"]  # Short responses for short conversations
+    if conversation_tokens < conversation_limits["medium"]:
+        return response_tokens["medium"]  # Medium responses
+    if conversation_tokens < conversation_limits["long"]:
+        return response_tokens["long"]  # Longer responses for complex conversations
+    return response_tokens["max"]  # Max response for very long conversations
 
 
 def get_conversation_token_distribution(events: list[ChatEvent]) -> dict[str, int]:
@@ -141,7 +140,7 @@ def get_conversation_token_distribution(events: list[ChatEvent]) -> dict[str, in
     distribution: dict[str, int] = {}
 
     for event in events:
-        tokens = event.ensure_token_count()
+        tokens = event.compute_and_cache_tokens()
         event_type = event.type
         distribution[event_type] = distribution.get(event_type, 0) + tokens
 
@@ -151,7 +150,7 @@ def get_conversation_token_distribution(events: list[ChatEvent]) -> dict[str, in
 def optimize_conversation_for_tokens(
     events: list[ChatEvent],
     target_tokens: int,
-    preserve_recent: int = 5,
+    preserve_recent: int,
 ) -> list[ChatEvent]:
     """
     Optimize a conversation to fit within a token budget.
@@ -175,7 +174,7 @@ def optimize_conversation_for_tokens(
     older_events = events[:-preserve_recent] if preserve_recent > 0 else events
 
     # Calculate tokens for recent events
-    recent_tokens = sum(event.ensure_token_count() for event in recent_events)
+    recent_tokens = sum(event.compute_and_cache_tokens() for event in recent_events)
 
     if recent_tokens >= target_tokens:
         logger.warning(
@@ -189,7 +188,7 @@ def optimize_conversation_for_tokens(
     selected_older = []
 
     for event in reversed(older_events):
-        event_tokens = event.ensure_token_count()
+        event_tokens = event.compute_and_cache_tokens()
         if remaining_tokens >= event_tokens:
             selected_older.insert(0, event)  # Insert at beginning to maintain order
             remaining_tokens -= event_tokens

@@ -68,7 +68,6 @@ class ChatService:
         config: dict[str, Any]
         repo: Any  # ChatRepository
         configuration: Configuration
-        ctx_window: int = 4000
 
     def __init__(
         self,
@@ -79,7 +78,12 @@ class ChatService:
         self.config = service_config.config
         self.repo = service_config.repo
         self.configuration = service_config.configuration
-        self.ctx_window = service_config.ctx_window
+
+        # Get context configuration from configuration
+        context_config = self.configuration.get_context_config()
+        self.ctx_window = context_config["max_tokens"]
+        self.reserve_tokens = context_config["reserve_tokens"]
+
         self.chat_conf = self.config.get("chat", {}).get("service", {})
         self.tool_mgr: ToolSchemaManager | None = None
         self._init_lock = asyncio.Lock()
@@ -318,7 +322,7 @@ class ChatService:
             events,
             user_msg,
             self.ctx_window,
-            500  # reserve tokens
+            self.reserve_tokens  # Use configured reserve tokens
         )
         return conv
 
@@ -753,7 +757,7 @@ class ChatService:
             events,
             user_msg,
             self.ctx_window,
-            500  # reserve tokens
+            self.reserve_tokens  # Use configured reserve tokens
         )
 
         # 4) Generate assistant response with usage tracking
@@ -771,7 +775,6 @@ class ChatService:
             role="assistant",
             content=assistant_full_text,
             usage=total_usage,
-            provider=self.llm_client.config.get("provider", "unknown"),
             model=model,
             extra={"user_request_id": request_id},
         )
