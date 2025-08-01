@@ -24,7 +24,7 @@ from pydantic import AnyUrl
 import src.chat_service
 from src.chat_service import ChatService
 from src.config import Configuration
-from src.history.chat_store import JsonlRepo
+from src.history.chat_store import AsyncJsonlRepo, InMemoryRepo, JsonlRepo
 from src.websocket_server import run_websocket_server
 
 logging.basicConfig(
@@ -646,6 +646,26 @@ class LLMClient:
         await self.close()
 
 
+def create_repository(
+    config: Configuration,
+) -> JsonlRepo | AsyncJsonlRepo | InMemoryRepo:
+    """Create repository instance based on configuration."""
+    service_config = config.get_config_dict().get("chat", {}).get("service", {})
+    repo_config = service_config.get("repository", {})
+    repo_type = repo_config.get("type", "jsonl")
+    repo_path = repo_config.get("path", "events.jsonl")
+
+    if repo_type == "async_jsonl":
+        logging.info(f"Using AsyncJsonlRepo with path: {repo_path}")
+        return AsyncJsonlRepo(repo_path)
+    if repo_type == "memory":
+        logging.info("Using InMemoryRepo")
+        return InMemoryRepo()
+    # Default to "jsonl"
+    logging.info(f"Using JsonlRepo with path: {repo_path}")
+    return JsonlRepo(repo_path)
+
+
 async def main() -> None:
     """Main entry point - WebSocket interface with graceful shutdown handling."""
     config = Configuration()
@@ -667,8 +687,8 @@ async def main() -> None:
     llm_config = config.get_llm_config()
     api_key = config.llm_api_key
 
-    # Create repository for chat history
-    repo = JsonlRepo("events.jsonl")
+    # Create repository for chat history based on configuration
+    repo = create_repository(config)
 
     # Now that MCPClient and LLMClient are defined, make them available
     # in the chat_service module's namespace and rebuild ChatServiceConfig

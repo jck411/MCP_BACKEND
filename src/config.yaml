@@ -24,6 +24,11 @@ chat:
       You are a helpful assistant with a sense of humor.
       You have access to to a list of tools, use them when needed and explain why you used them.
 
+    # Repository configuration
+    repository:
+      type: "jsonl"  # Options: "jsonl", "async_jsonl", "memory"
+      path: "events.jsonl"  # File path for file-based repositories
+
     # Streaming configuration
     streaming:
       enabled: true  # Enable streaming by default (required setting)
