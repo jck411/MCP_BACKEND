@@ -26,6 +26,7 @@ dependencies = [
     "tiktoken>=0.7.0", # For accurate token counting
     "aiofiles>=24.1.0", # For async file I/O operations
     "filelock>=3.18.0",
+    "structlog>=25.4.0",
 ]
 
 [project.scripts]
