@@ -7,6 +7,7 @@ and conversion between MCP and OpenAI formats using the official MCP SDK.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -35,17 +36,26 @@ class ToolSchemaManager:
         self._schema_cache: dict[str, type[BaseModel]] = {}
 
     async def initialize(self) -> None:
-        """Initialize registries by collecting tools, prompts, and resources."""
+        """
+        Initialize registries by collecting tools, prompts, and resources concurrently.
+        """
         self._tool_registry.clear()
         self._prompt_registry.clear()
         self._resource_registry.clear()
         self._openai_tools.clear()
         self._schema_cache.clear()
 
+        # Create all registration tasks for concurrent execution
+        registration_tasks = []
         for client in self.clients:
-            await self._register_client_tools(client)
-            await self._register_client_prompts(client)
-            await self._register_client_resources(client)
+            registration_tasks.extend([
+                self._register_client_tools(client),
+                self._register_client_prompts(client),
+                self._register_client_resources(client),
+            ])
+
+        # Execute all registration tasks concurrently
+        await asyncio.gather(*registration_tasks, return_exceptions=True)
 
         logger.info(
             f"Initialized registries with {len(self._tool_registry)} tools, "
