@@ -211,18 +211,12 @@ class ChatService:
         self, conversation_id: str, user_msg: str, request_id: str
     ) -> bool:
         """
-        Handle user message persistence with comprehensive idempotency checks.
+        Handle user message persistence with simplified idempotency checks.
 
-        This internal method implements the core idempotency logic for the chat system.
-        It first checks if an assistant response already exists for the given
-        request_id, then attempts to persist the user message. If the user message
-        is a duplicate, it performs a second check for existing responses to handle
-        race conditions.
-
-        The method follows a defensive programming pattern:
-        1. Check for existing response (prevents double-billing)
-        2. Attempt to persist user message
-        3. If duplicate detected, re-check for response (handles concurrent requests)
+        This method now persists the user message first and then performs a single
+        check for an existing assistant response.  If an assistant response already
+        exists for this request, it returns False so that the cached response can
+        be returned.  Otherwise it returns True to continue processing.
 
         Args:
             conversation_id: The conversation identifier
@@ -232,20 +226,9 @@ class ChatService:
         Returns:
             bool: True if processing should continue (new request), False if response
                   already exists (cached response should be returned)
-
-        Side Effects:
-            - Creates a ChatEvent for the user message and persists it to repository
-            - Computes and caches token count for the user message
         """
-        # Check for existing response first
-        existing_response = await self._get_existing_assistant_response(
-            conversation_id, request_id
-        )
-        if existing_response:
-            logger.info(f"Returning cached response for request_id: {request_id}")
-            return False
-
-        # Persist user message
+        # Create user event and persist it.  If this is a duplicate request ID,
+        # the repo will return False and not store another user event.
         user_ev = ChatEvent(
             conversation_id=conversation_id,
             seq=0,  # Will be assigned by repository
@@ -255,19 +238,16 @@ class ChatService:
             extra={"request_id": request_id},
         )
         user_ev.compute_and_cache_tokens()
-        was_added = await self.repo.add_event(user_ev)
+        _ = await self.repo.add_event(user_ev)
 
-        if not was_added:
-            # Check for existing response again after duplicate detection
-            existing_response = await self._get_existing_assistant_response(
-                conversation_id, request_id
-            )
-            if existing_response:
-                logger.info(
-                    "Returning existing response for duplicate "
-                    f"request_id: {request_id}"
-                )
-                return False
+        # After persisting (or detecting duplicate), check once for an existing
+        # response.
+        existing_response = await self._get_existing_assistant_response(
+            conversation_id, request_id
+        )
+        if existing_response:
+            logger.info(f"Returning cached response for request_id: {request_id}")
+            return False
 
         return True
 
@@ -281,9 +261,6 @@ class ChatService:
         response when handling duplicate requests. It maintains consistency with
         the streaming interface by yielding ChatMessage objects even for cached
         content.
-
-        Used in the idempotency flow when _handle_user_message_persistence returns
-        False, indicating that a response already exists for the given request_id.
 
         Args:
             conversation_id: The conversation identifier
@@ -386,16 +363,7 @@ class ChatService:
         and monitoring purposes.
 
         The method respects the chat service logging configuration and only logs
-        if 'llm_replies' is enabled. It uses the _log_llm_reply helper to ensure
-        consistent log formatting across all LLM interactions.
-
-        Args:
-            assistant_msg: The raw assistant message dictionary from the LLM API,
-                          containing content, tool_calls, and other response data
-
-        Side Effects:
-            - May write to application logs if logging is enabled
-            - Does not modify the assistant_msg or any other state
+        if 'llm_replies' is enabled.
         """
         reply_data = {
             "message": assistant_msg,
