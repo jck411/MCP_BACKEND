@@ -11,7 +11,7 @@ import logging
 from typing import Any
 
 from src.history.chat_store import ChatEvent
-from src.history.token_counter import count_conversation_tokens
+from src.history.token_counter import count_conversation_tokens, estimate_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,8 @@ def build_conversation_with_token_limit(
     Build a conversation list with token limit enforcement.
 
     This function builds an OpenAI-style conversation while respecting
-    token limits and reserving space for the response.
+    token limits and reserving space for the response. Uses incremental
+    token counting to avoid redundant computation.
 
     Args:
         system_prompt: The system prompt to include
@@ -39,67 +40,67 @@ def build_conversation_with_token_limit(
     Returns:
         Tuple of (conversation_list, total_tokens_used)
     """
-    # Start with minimal conversation: system + current user message
-    # This establishes the baseline token cost that we cannot reduce
-    base_conversation = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    ]
 
-    # Calculate the immutable token cost (system prompt + user message)
-    base_tokens = count_conversation_tokens(base_conversation)
+    # Calculate base token costs using cached estimates
+    system_tokens = estimate_tokens(system_prompt)
+    user_tokens = estimate_tokens(user_message)
 
-    # Calculate how many tokens we have available for historical events
-    # This is our "budget" for including conversation history
+    # Account for OpenAI message formatting overhead
+    # (3 tokens per message + 3 for priming)
+    message_overhead = 3 * 2 + 3  # system + user messages + priming
+    base_tokens = system_tokens + user_tokens + message_overhead
+
+    # Calculate available token budget for historical events
     available_tokens = max_tokens - base_tokens - reserve_tokens
 
     # Early exit if system prompt + user message already exceed limits
-    # This prevents infinite loops and provides clear error messaging
     if available_tokens <= 0:
         logger.warning(
             f"System prompt and user message exceed token limit. "
             f"Base: {base_tokens}, Max: {max_tokens}, Reserve: {reserve_tokens}"
         )
+        base_conversation = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
         return base_conversation, base_tokens
 
-    # Build conversation incrementally, starting with system prompt
-    # We'll add historical events between system and user message
+    # Build conversation incrementally with token accumulation
     conversation = [{"role": "system", "content": system_prompt}]
+    accumulated_tokens = system_tokens + 3  # system message + overhead
 
     # Process events in chronological order to maintain conversation flow
-    # Each event is tested before inclusion to ensure we don't exceed limits
     for event in events:
         # Only include events that make sense in LLM conversation context
         if event.type in ("user_message", "assistant_message", "system_update"):
-            event_msg = {"role": event.role, "content": event.content or ""}
+            # Get cached token count for this event
+            event_tokens = event.compute_and_cache_tokens()
+            event_overhead = 3  # message formatting overhead
+            total_event_cost = event_tokens + event_overhead
 
-            # Create test conversation with this event included
-            # This allows us to calculate exact token impact
-            test_conversation = [*conversation, event_msg]
+            # Check if adding this event would exceed our budget
+            # Account for user message that will be added at the end
+            projected_total = (
+                accumulated_tokens + total_event_cost + user_tokens + 3 + 3
+            )  # user msg + overhead + priming
 
-            # Calculate final token count if we include this event + user message
-            # The user message must always be last, so we simulate the final state
-            final_tokens_with_user = count_conversation_tokens(
-                [*test_conversation, {"role": "user", "content": user_message}]
-            )
-
-            # Check if including this event would breach our token budget
-            # We need to account for both the final conversation AND reserved tokens
-            if final_tokens_with_user + reserve_tokens > max_tokens:
+            if projected_total + reserve_tokens > max_tokens:
                 logger.debug(
                     f"Stopping conversation build at {len(conversation)} messages. "
-                    f"Would use {final_tokens_with_user} + {reserve_tokens} tokens."
+                    f"Would use {projected_total} + {reserve_tokens} tokens."
                 )
                 break  # Stop adding events - we've hit our limit
 
             # Safe to include this event - add it to the conversation
+            event_msg = {"role": event.role, "content": event.content or ""}
             conversation.append(event_msg)
+            accumulated_tokens += total_event_cost
 
     # Always append the current user message last (required for OpenAI format)
     conversation.append({"role": "user", "content": user_message})
-
-    # Calculate and return final token count for monitoring/logging
-    final_tokens = count_conversation_tokens(conversation)
+    final_tokens = (
+        accumulated_tokens + user_tokens + 3 + 3
+    )  # user msg + overhead + priming
 
     return conversation, final_tokens
 
