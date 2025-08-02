@@ -251,17 +251,25 @@ class ChatService:
         self, conversation_id: str, user_msg: str, request_id: str
     ) -> bool:
         """
-        *First* look for an assistant reply for this request_id.  If found we
-        can immediately return cached output without touching disk.
+        Handle user message persistence with concurrency-safe duplicate detection.
+
+        CONCURRENCY SAFETY: This method implements a two-level check pattern:
+        1. First check for existing assistant response (complete request)
+        2. Then check for existing user message (request in progress)
+
+        This prevents race conditions where multiple processes/coroutines handle
+        the same request_id simultaneously, ensuring idempotent behavior.
         """
+        # CONCURRENCY SAFETY: First check for completed assistant response
+        # If found, we can return cached output without any disk writes
         existing = await self._get_existing_assistant_response(
             conversation_id, request_id
         )
         if existing:
             return False                           # tell caller to use cache
 
-        # If somebody else is *currently* working on the same request we might
-        # already have the user event.
+        # CONCURRENCY SAFETY: Check if another process is already working on
+        # this request (user message exists but no assistant response yet)
         if await self.repo.event_exists(
             conversation_id, "user_message", request_id
         ):
@@ -734,7 +742,9 @@ class ChatService:
             raise RuntimeError("Tool manager not initialized")
 
         async with self._conv_lock(conversation_id):          # NEW 🔒
-            # Check for existing response to prevent double-billing
+            # CONCURRENCY SAFETY: Check for existing response prevents duplicate
+            # LLM calls and double-billing when multiple processes handle the
+            # same request_id simultaneously in non-streaming mode.
             existing_response = await self._get_existing_assistant_response(
                 conversation_id, request_id
             )

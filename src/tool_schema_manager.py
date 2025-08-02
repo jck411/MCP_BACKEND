@@ -94,7 +94,9 @@ class ToolSchemaManager:
             for tool in tools:
                 tool_name = tool.name
 
-                # Handle name conflicts by prefixing with client name
+                # CONCURRENCY SAFETY: Handle name conflicts by prefixing with client
+                # name. This prevents tool collisions when multiple MCP servers
+                # provide tools with identical names, ensuring each remains accessible.
                 if tool_name in self._tool_registry:
                     logger.warning(f"Tool name conflict: '{tool_name}' already exists")
                     tool_name = f"{client.name}_{tool_name}"
@@ -131,6 +133,9 @@ class ToolSchemaManager:
             prompts = await client.list_prompts()
             for prompt in prompts:
                 prompt_name = prompt.name
+                # CONCURRENCY SAFETY: Handle prompt name conflicts by prefixing
+                # with client name. Prevents collisions when multiple MCP servers
+                # provide prompts with identical names.
                 if prompt_name in self._prompt_registry:
                     logger.warning(
                         f"Prompt name conflict: '{prompt_name}' already exists"
@@ -161,6 +166,9 @@ class ToolSchemaManager:
             resources = await client.list_resources()
             for resource in resources:
                 resource_uri = str(resource.uri)
+                # CONCURRENCY SAFETY: Handle resource URI conflicts by prefixing
+                # with client name. Prevents collisions when multiple MCP servers
+                # provide resources with identical URIs.
                 if resource_uri in self._resource_registry:
                     logger.warning(
                         f"Resource URI conflict: '{resource_uri}' already exists"

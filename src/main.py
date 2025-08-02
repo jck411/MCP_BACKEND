@@ -503,6 +503,9 @@ class MCPClient:
     async def close(self) -> None:
         """Close the client connection and clean up resources."""
         async with self._cleanup_lock:
+            # CONCURRENCY SAFETY: Check if already closed prevents duplicate
+            # cleanup operations when multiple coroutines attempt to close
+            # the same client simultaneously, avoiding resource cleanup errors.
             if not self._is_connected:
                 return  # Already closed
 

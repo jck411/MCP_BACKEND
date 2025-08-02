@@ -457,6 +457,10 @@ class AsyncJsonlRepo(ChatRepository):
             return
 
         async with self._lock:
+            # CONCURRENCY SAFETY: Double-check pattern prevents race conditions
+            # Multiple coroutines may pass the first check simultaneously, but only
+            # the first one to acquire the lock should perform the loading operation.
+            # This prevents duplicate initialization work and data corruption.
             if self._loaded:  # Double-check with lock held
                 return
             await self._load_async()
@@ -568,7 +572,9 @@ class AsyncJsonlRepo(ChatRepository):
         async with self._lock:
             events = self._by_conv.setdefault(event.conversation_id, [])
 
-            # Check for duplicate by request_id if present - O(1) lookup
+            # CONCURRENCY SAFETY: Check for duplicate by request_id prevents
+            # race conditions where multiple processes/coroutines attempt to
+            # add the same logical event simultaneously. Uses O(1) set lookup.
             request_id = event.extra.get("request_id")
             if request_id:
                 req_ids = self._req_ids.setdefault(event.conversation_id, set())
@@ -655,7 +661,9 @@ class AsyncJsonlRepo(ChatRepository):
         async with self._lock:
             events = self._by_conv.get(conversation_id, [])
 
-            # Check if assistant message already exists for this user_request_id
+            # CONCURRENCY SAFETY: Check if assistant message already exists
+            # prevents duplicate compaction when multiple processes/coroutines
+            # attempt to compact the same delta sequence simultaneously.
             req_ids = self._req_ids.setdefault(conversation_id, set())
             assistant_req_id = f"assistant:{user_request_id}"
             if assistant_req_id in req_ids:
@@ -734,7 +742,9 @@ class AsyncJsonlRepo(ChatRepository):
             processed_events = []
 
             for event in events:
-                # Check for duplicate by request_id if present
+                # CONCURRENCY SAFETY: Check for duplicate by request_id prevents
+                # race conditions in batch operations where multiple processes
+                # might attempt to add overlapping event sets simultaneously.
                 request_id = event.extra.get("request_id")
                 if request_id:
                     req_ids = self._req_ids.setdefault(event.conversation_id, set())
