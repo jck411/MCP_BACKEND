@@ -18,7 +18,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
 
-from src.chat_service import ChatService
+from src.chat_service import ChatMessage, ChatService
 from src.config import Configuration
 from src.history.chat_store import ChatRepository
 
@@ -263,10 +263,13 @@ class WebSocketServer:
     ):
         """Handle streaming chat response."""
         # Stream response chunks using new signature (no external history needed)
-        async for chat_message in self.chat_service.process_message(
+        async for item in self.chat_service.process_message(
             conversation_id, user_message, request_id
         ):
-            await self._send_chat_response(websocket, request_id, chat_message)
+            # Only process ChatMessage objects - skip raw dictionaries
+            # Raw dictionaries are internal state used by chat service
+            if isinstance(item, ChatMessage):
+                await self._send_chat_response(websocket, request_id, item)
 
         # Send completion signal
         await websocket.send_text(
@@ -318,7 +321,7 @@ class WebSocketServer:
         )
 
     async def _send_chat_response(
-        self, websocket: WebSocket, request_id: str, chat_message
+        self, websocket: WebSocket, request_id: str, chat_message: ChatMessage
     ):
         """Send a chat response to the frontend."""
         logger.info(
@@ -329,23 +332,24 @@ class WebSocketServer:
 
         # Convert chat service message to frontend format
         if chat_message.type == "text":
-            # Only send text messages that aren't tool results
-            if not chat_message.metadata.get("tool_result"):
-                await websocket.send_text(
-                    json.dumps(
-                        {
-                            "request_id": request_id,
-                            "status": "chunk",
-                            "chunk": {
-                                "type": "text",
-                                "data": chat_message.content,
-                                "metadata": chat_message.metadata,
-                            },
-                        }
-                    )
+            # ALWAYS send text messages immediately - this is critical for UX
+            # Text content must be streamed immediately, regardless of tool calls
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "status": "chunk",
+                        "chunk": {
+                            "type": "text",
+                            "data": chat_message.content,
+                            "metadata": chat_message.metadata,
+                        },
+                    }
                 )
+            )
 
         elif chat_message.type == "tool_execution":
+            # Send tool execution notification to keep user informed
             await websocket.send_text(
                 json.dumps(
                     {
@@ -372,6 +376,11 @@ class WebSocketServer:
                         },
                     }
                 )
+            )
+        else:
+            # Log unhandled message types for debugging
+            logger.warning(
+                f"Unhandled chat message type: {chat_message.type}"
             )
 
     async def _connect_websocket(self, websocket: WebSocket):
