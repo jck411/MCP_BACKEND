@@ -181,16 +181,19 @@ class ChatEvent(BaseModel):
             self.compute_and_cache_tokens()
 
 
-def _visible_to_llm(event: ChatEvent) -> bool:
+def _visible_to_llm(
+    event: ChatEvent, visibility_config: dict[str, Any] | None = None
+) -> bool:
     """
-    Determine if an event should be visible to the LLM in context.
+    Determine if a chat event should be visible to the LLM.
 
-    This function implements the filtering logic for what events should be
-    included when building context for LLM requests. It excludes internal
+    This function filters events to only include those that are relevant for
+    LLM context. It excludes internal system events, metadata updates, and
     system events and metadata that would confuse the model.
 
     Args:
         event: ChatEvent to evaluate for LLM visibility
+        visibility_config: Optional visibility configuration from config.yaml
 
     Returns:
         bool: True if the event should be included in LLM context
@@ -199,13 +202,24 @@ def _visible_to_llm(event: ChatEvent) -> bool:
         return True
     if event.type == "system_update":
         # Only show system updates explicitly marked as visible
+        if visibility_config:
+            # Use explicit configuration if provided
+            default_visible = visibility_config.get(
+                "system_updates_visible_to_llm", False
+            )
+            return event.extra.get("visible_to_llm", default_visible)
+        # Fallback for backward compatibility - require explicit marking
         return event.extra.get("visible_to_llm", False)
     # Hide meta events, tool_calls, and other internal events
+    if visibility_config:
+        return visibility_config.get("default_visible_to_llm", False)
     return False
 
 
 def _get_last_n_token_events(
-    events: list[ChatEvent], max_tokens: int
+    events: list[ChatEvent],
+    max_tokens: int,
+    visibility_config: dict[str, Any] | None = None
 ) -> list[ChatEvent]:
     """
     Get the last N tokens worth of events from a conversation.
@@ -217,6 +231,7 @@ def _get_last_n_token_events(
     Args:
         events: List of ChatEvents in chronological order
         max_tokens: Maximum number of tokens to include
+        visibility_config: Optional visibility configuration from config.yaml
 
     Returns:
         list[ChatEvent]: Events that fit within the token limit, in chronological order
@@ -225,7 +240,7 @@ def _get_last_n_token_events(
         return []
 
     # Filter to only LLM-visible events and work backwards
-    visible_events = [e for e in events if _visible_to_llm(e)]
+    visible_events = [e for e in events if _visible_to_llm(e, visibility_config)]
     if not visible_events:
         return []
 

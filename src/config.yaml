@@ -56,6 +56,12 @@ chat:
     # Streaming configuration
     streaming:
       enabled: true  # Enable streaming by default (required setting)
+      
+      # Streaming backoff configuration for file lock handling
+      backoff:
+        max_attempts: 5        # Maximum number of retry attempts
+        initial_delay: 0.05    # Initial backoff delay in seconds
+        flush_every_n_deltas: 25  # Flush frequency for streaming deltas
 
     # Tool execution configuration
     max_tool_hops: 8  # Maximum number of recursive tool calls to prevent infinite loops
@@ -89,6 +95,9 @@ llm:
       temperature: 0.7
       max_tokens: 4096
       top_p: 1.0
+      
+      # Response parsing defaults
+      choice_index: 0  # Default choice index for response parsing
 
     groq:
       base_url: "https://api.groq.com/openai/v1"
@@ -96,6 +105,9 @@ llm:
       temperature: 0.7
       max_tokens: 4096
       top_p: 1.0
+      
+      # Response parsing defaults
+      choice_index: 0  # Default choice index for response parsing
 
     openrouter:
       base_url: "https://openrouter.ai/api/v1"
@@ -103,6 +115,9 @@ llm:
       temperature: 0.7
       max_tokens: 4096
       top_p: 1.0
+      
+      # Response parsing defaults
+      choice_index: 0  # Default choice index for response parsing
 
     anthropic:
       base_url: "https://api.anthropic.com/v1"
@@ -110,6 +125,9 @@ llm:
       temperature: 0.7
       max_tokens: 4096
       top_p: 1.0
+      
+      # Response parsing defaults
+      choice_index: 0  # Default choice index for response parsing
 
     azure:
       base_url: "https://your-resource.openai.azure.com/openai/deployments/your-deployment"
@@ -118,6 +136,9 @@ llm:
       max_tokens: 4096
       top_p: 1.0
       api_version: "2024-02-15-preview"
+      
+      # Response parsing defaults
+      choice_index: 0  # Default choice index for response parsing
 
 # Logging Configuration
 logging:
@@ -127,6 +148,17 @@ logging:
 # MCP Server Configuration
 mcp:
   config_file: "servers_config.json"
+  
+  # Server execution configuration
+  server_execution:
+    # Default arguments for server commands (explicit empty list)
+    default_args: []
+    
+    # Default environment variables (explicit empty dict)
+    default_env: {}
+    
+    # Server enablement check (require explicit enabled flag)
+    require_enabled_flag: true
   
   # Connection and retry configuration
   connection:
@@ -145,3 +177,13 @@ mcp:
     
     # Ping timeout for connection health checks (seconds)
     ping_timeout: 10.0
+
+# Chat Event Store Configuration  
+chat_store:
+  # Event visibility configuration for LLM context
+  visibility:
+    # System update visibility (require explicit marking)
+    system_updates_visible_to_llm: false
+    
+    # Default visibility for new event types
+    default_visible_to_llm: false

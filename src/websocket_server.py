@@ -416,79 +416,122 @@ class WebSocketServer:
         # Initialize chat service
         await self.chat_service.initialize()
 
-        # Start server
-        host = self.config.get("websocket", {}).get("host", "localhost")
-        port = self.config.get("websocket", {}).get("port", 8000)
-
-        logger.info(f"Starting WebSocket server on {host}:{port}")
-
-        server_config = uvicorn.Config(self.app, host=host, port=port, log_level="info")
-        server = uvicorn.Server(server_config)
+        # Get server configuration and create server instance
+        host, port = self._get_server_config()
+        server = self._create_uvicorn_server(host, port)
 
         # Store server reference for graceful shutdown
         self._server = server
 
         try:
-            if shutdown_event:
-                # Run server with shutdown monitoring
-                server_task = asyncio.create_task(server.serve())
-                shutdown_task = asyncio.create_task(shutdown_event.wait())
-
-                done, pending = await asyncio.wait(
-                    [server_task, shutdown_task],
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-
-                # If shutdown was requested, gracefully shut down server
-                if shutdown_task in done:
-                    logger.info(
-                        "Shutdown signal received, gracefully stopping server..."
-                    )
-                    server.should_exit = True
-
-                    # Wait a brief moment for graceful shutdown
-                    try:
-                        await asyncio.wait_for(server_task, timeout=5.0)
-                    except TimeoutError:
-                        logger.warning(
-                            "Server didn't shut down gracefully within timeout"
-                        )
-                        server_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await server_task
-                else:
-                    # Server completed naturally or with error
-                    shutdown_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await shutdown_task
-
-                    # Check for server exceptions
-                    if server_task.done() and not server_task.cancelled():
-                        exception = server_task.exception()
-                        if exception is not None:
-                            raise exception
-            else:
-                # Run server normally without shutdown monitoring
-                await server.serve()
-
+            await self._run_server_with_monitoring(server, shutdown_event)
         except KeyboardInterrupt:
             logger.info("Received shutdown signal, cleaning up...")
         except Exception as e:
             logger.error(f"WebSocket server error: {e}")
             raise
         finally:
-            logger.info("Shutting down WebSocket server and cleaning up resources...")
+            await self._cleanup_server_resources()
 
-            # Ensure server is stopped
-            if hasattr(self, '_server') and self._server:
-                self._server.should_exit = True
+    def _get_server_config(self) -> tuple[str, int]:
+        """Get and validate WebSocket server configuration."""
+        # Use the Configuration class method to get properly nested websocket config
+        websocket_config = self.configuration.get_websocket_config()
 
-            try:
-                await self.chat_service.cleanup()
-                logger.info("Chat service cleanup completed")
-            except Exception as e:
-                logger.error(f"Error during chat service cleanup: {e}")
-                # Don't re-raise cleanup errors to avoid masking the original exception
+        if "host" not in websocket_config:
+            raise ValueError(
+                "WebSocket host must be explicitly configured in config.yaml "
+                "under chat.websocket.host"
+            )
+        if "port" not in websocket_config:
+            raise ValueError(
+                "WebSocket port must be explicitly configured in config.yaml "
+                "under chat.websocket.port"
+            )
+
+        host = websocket_config["host"]
+        port = websocket_config["port"]
+
+        logger.info(f"Starting WebSocket server on {host}:{port}")
+        return host, port
+
+    def _create_uvicorn_server(self, host: str, port: int) -> uvicorn.Server:
+        """Create and configure the uvicorn server instance."""
+        server_config = uvicorn.Config(
+            self.app, host=host, port=port, log_level="info"
+        )
+        return uvicorn.Server(server_config)
+
+    async def _run_server_with_monitoring(
+        self, server: uvicorn.Server, shutdown_event: asyncio.Event | None
+    ) -> None:
+        """Run the server with optional shutdown monitoring."""
+        if shutdown_event:
+            await self._run_with_shutdown_monitoring(server, shutdown_event)
+        else:
+            await server.serve()
+
+    async def _run_with_shutdown_monitoring(
+        self, server: uvicorn.Server, shutdown_event: asyncio.Event
+    ) -> None:
+        """Run server with shutdown event monitoring."""
+        server_task = asyncio.create_task(server.serve())
+        shutdown_task = asyncio.create_task(shutdown_event.wait())
+
+        done, pending = await asyncio.wait(
+            [server_task, shutdown_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        if shutdown_task in done:
+            await self._handle_graceful_shutdown(server, server_task)
+        else:
+            await self._handle_server_completion(server_task, shutdown_task)
+
+    async def _handle_graceful_shutdown(
+        self, server: uvicorn.Server, server_task: asyncio.Task
+    ) -> None:
+        """Handle graceful shutdown when shutdown signal received."""
+        logger.info("Shutdown signal received, gracefully stopping server...")
+        server.should_exit = True
+
+        # Wait for graceful shutdown with timeout
+        try:
+            await asyncio.wait_for(server_task, timeout=5.0)
+        except TimeoutError:
+            logger.warning("Server didn't shut down gracefully within timeout")
+            server_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await server_task
+
+    async def _handle_server_completion(
+        self, server_task: asyncio.Task, shutdown_task: asyncio.Task
+    ) -> None:
+        """Handle server completion when no shutdown signal received."""
+        shutdown_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await shutdown_task
+
+        # Check for server exceptions
+        if server_task.done() and not server_task.cancelled():
+            exception = server_task.exception()
+            if exception is not None:
+                raise exception
+
+    async def _cleanup_server_resources(self) -> None:
+        """Clean up server resources during shutdown."""
+        logger.info("Shutting down WebSocket server and cleaning up resources...")
+
+        # Ensure server is stopped
+        if hasattr(self, '_server') and self._server:
+            self._server.should_exit = True
+
+        try:
+            await self.chat_service.cleanup()
+            logger.info("Chat service cleanup completed")
+        except Exception as e:
+            logger.error(f"Error during chat service cleanup: {e}")
+            # Don't re-raise cleanup errors to avoid masking the original exception
 
 
 async def run_websocket_server(server_config: ServerConfig) -> None:

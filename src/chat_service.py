@@ -37,32 +37,32 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 # Utility helpers                                                             #
 # --------------------------------------------------------------------------- #
-_MAX_BACKOFF_ATTEMPTS = 5
-_INITIAL_BACKOFF      = 0.05      # seconds
-_FLUSH_EVERY_N_DELTAS = 25        # tune to taste
 
-
-async def _write_with_backoff(coro_func):
+async def _write_with_backoff(coro_func, backoff_config: dict[str, Any]):
     """
     Execute a coroutine function that *writes* to the repo and retry with exponential
     back-off if it raises a file-lock exception.
 
     Args:
         coro_func: A callable that returns a coroutine when called
+        backoff_config: Configuration dict with max_attempts and initial_delay
 
     Assumes the exception message contains `'events.jsonl.lock'`.
     """
-    for attempt in range(_MAX_BACKOFF_ATTEMPTS):
+    max_attempts = backoff_config["max_attempts"]
+    initial_delay = backoff_config["initial_delay"]
+
+    for attempt in range(max_attempts):
         try:
             return await coro_func()
         except (OSError, RuntimeError) as e:
             msg = str(e)
             if "events.jsonl.lock" not in msg:
                 raise                                 # unrelated problem
-            sleep = _INITIAL_BACKOFF * (2 ** attempt) + random.random() * 0.02
+            sleep = initial_delay * (2 ** attempt) + random.random() * 0.02
             logger.debug(
                 f"File-lock contention detected - retry {attempt+1}/"
-                f"{_MAX_BACKOFF_ATTEMPTS} in {sleep:.2f}s"
+                f"{max_attempts} in {sleep:.2f}s"
             )
             await asyncio.sleep(sleep)
     # last try
@@ -121,6 +121,9 @@ class ChatService:
         context_config = self.configuration.get_context_config()
         self.ctx_window = context_config["max_tokens"]
         self.reserve_tokens = context_config["reserve_tokens"]
+
+        # Get streaming backoff configuration
+        self.backoff_config = self.configuration.get_streaming_backoff_config()
 
         self.chat_conf = self.config.get("chat", {}).get("service", {})
         self.tool_mgr: ToolSchemaManager | None = None
@@ -274,7 +277,9 @@ class ChatService:
             extra={"request_id": request_id},
         )
         user_ev.compute_and_cache_tokens()
-        await _write_with_backoff(lambda: self.repo.add_event(user_ev))
+        await _write_with_backoff(
+            lambda: self.repo.add_event(user_ev), self.backoff_config
+        )
         return True
 
     async def _yield_existing_response(
@@ -377,7 +382,7 @@ class ChatService:
             full_content,
             usage=self._convert_usage(None),
             model=self.llm_client.config.get("model", "")
-        ))
+        ), self.backoff_config)
 
     def _log_initial_response(self, assistant_msg: dict[str, Any]) -> None:
         """
@@ -474,7 +479,9 @@ class ChatService:
             batch = pending_deltas
             pending_deltas = []
             # Use bulk write method
-            await _write_with_backoff(lambda: self.repo.add_events(batch))
+            await _write_with_backoff(
+                lambda: self.repo.add_events(batch), self.backoff_config
+            )
 
         delta_index = 0
         finish_reason: str | None = None
@@ -520,7 +527,8 @@ class ChatService:
                 finish_reason = choice["finish_reason"]
 
             # flush periodically
-            if len(pending_deltas) >= _FLUSH_EVERY_N_DELTAS:
+            flush_every_n_deltas = self.backoff_config["flush_every_n_deltas"]
+            if len(pending_deltas) >= flush_every_n_deltas:
                 await _flush()
 
         await _flush()                    # final flush
@@ -749,7 +757,9 @@ class ChatService:
                     extra={"request_id": request_id},
                 )
                 user_ev.compute_and_cache_tokens()
-                await _write_with_backoff(lambda: self.repo.add_event(user_ev))
+                await _write_with_backoff(
+                    lambda: self.repo.add_event(user_ev), self.backoff_config
+                )
 
             # 2) build canonical history from repo
             events = await self.repo.last_n_tokens(conversation_id, self.ctx_window)
@@ -781,7 +791,9 @@ class ChatService:
             )
             # Ensure token count is computed
             assistant_ev.compute_and_cache_tokens()
-            await _write_with_backoff(lambda: self.repo.add_event(assistant_ev))
+            await _write_with_backoff(
+                lambda: self.repo.add_event(assistant_ev), self.backoff_config
+            )
 
             return assistant_ev
 

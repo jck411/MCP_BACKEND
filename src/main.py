@@ -50,6 +50,7 @@ class MCPClient:
         name: str,
         config: dict[str, Any],
         connection_config: dict[str, Any] | None = None,
+        server_execution_config: dict[str, Any] | None = None,
     ) -> None:
         """
         Initialize MCP client with configurable connection parameters.
@@ -58,9 +59,11 @@ class MCPClient:
             name: Client name for logging and identification
             config: Server-specific configuration (command, args, etc.)
             connection_config: Connection and retry configuration parameters
+            server_execution_config: Server execution defaults configuration
         """
         self.name: str = name
         self.config: dict[str, Any] = config
+        self.server_execution_config = server_execution_config
         self.session: ClientSession | None = None
         self.exit_stack: AsyncExitStack = AsyncExitStack()
         self._cleanup_lock: asyncio.Lock = asyncio.Lock()
@@ -68,19 +71,40 @@ class MCPClient:
         self._is_connected: bool = False
         self.client_version = "0.1.0"
 
-        # Configure connection parameters from config or use defaults
-        conn_config = connection_config or {}
-        self._max_reconnect_attempts: int = conn_config.get(
-            "max_reconnect_attempts", 5
-        )
-        self._initial_reconnect_delay: float = conn_config.get(
-            "initial_reconnect_delay", 1.0
-        )
-        self._max_reconnect_delay: float = conn_config.get(
-            "max_reconnect_delay", 30.0
-        )
-        self._connection_timeout: float = conn_config.get("connection_timeout", 30.0)
-        self._ping_timeout: float = conn_config.get("ping_timeout", 10.0)
+        # Configure connection parameters from config - no defaults
+        if not connection_config:
+            raise ValueError(
+                "connection_config must be provided - no default connection "
+                "parameters allowed"
+            )
+
+        # Validate all required connection parameters are present
+        required_params = [
+            "max_reconnect_attempts",
+            "initial_reconnect_delay",
+            "max_reconnect_delay",
+            "connection_timeout",
+            "ping_timeout"
+        ]
+
+        for param in required_params:
+            if param not in connection_config:
+                raise ValueError(
+                    f"Required connection parameter '{param}' not found in "
+                    "connection_config"
+                )
+
+        self._max_reconnect_attempts: int = connection_config[
+            "max_reconnect_attempts"
+        ]
+        self._initial_reconnect_delay: float = connection_config[
+            "initial_reconnect_delay"
+        ]
+        self._max_reconnect_delay: float = connection_config[
+            "max_reconnect_delay"
+        ]
+        self._connection_timeout: float = connection_config["connection_timeout"]
+        self._ping_timeout: float = connection_config["ping_timeout"]
 
         # Initialize reconnect delay to the configured initial value
         self._reconnect_delay: float = self._initial_reconnect_delay
@@ -216,13 +240,43 @@ class MCPClient:
                 f"Command '{self.config.get('command')}' not found in PATH"
             )
 
+        # Configure server parameters - explicit configuration required
+        if "args" not in self.config:
+            raise ValueError(
+                f"Server '{self.name}' must have explicit 'args' configuration "
+                "(use empty list [] if no arguments needed)"
+            )
+
+        if "env" not in self.config:
+            raise ValueError(
+                f"Server '{self.name}' must have explicit 'env' configuration "
+                "(use empty dict {{}} if no environment variables needed)"
+            )
+
+        # Configure server parameters - require explicit configuration
+        if "args" in self.config:
+            args = self.config["args"]
+        elif self.server_execution_config:
+            args = self.server_execution_config["default_args"]
+        else:
+            raise ValueError(
+                f"No args configured for server '{self.name}' and no "
+                "server_execution_config provided"
+            )
+
+        if "env" in self.config:
+            env_vars = {**os.environ, **self.config["env"]}
+        elif self.server_execution_config:
+            default_env = self.server_execution_config["default_env"]
+            env_vars = {**os.environ, **default_env} if default_env else None
+        else:
+            env_vars = None
+
         # Configure server parameters with environment inheritance
         server_params = StdioServerParameters(
             command=command,
-            args=self.config.get("args", []),
-            env={**os.environ, **self.config.get("env", {})}
-            if self.config.get("env")
-            else None,
+            args=args,
+            env=env_vars,
         )
 
         # Initialize stdio transport for server communication
@@ -481,6 +535,15 @@ class LLMClient:
     """HTTP client for LLM API requests with structured tool call support."""
 
     def __init__(self, config: dict[str, Any], api_key: str) -> None:
+        # Validate required configuration parameters
+        required_keys = ["base_url", "model", "temperature", "max_tokens", "top_p"]
+        for key in required_keys:
+            if key not in config:
+                raise ValueError(
+                    f"Required LLM configuration parameter '{key}' not found. "
+                    "All LLM parameters must be explicitly configured."
+                )
+
         self.config: dict[str, Any] = config
         self.api_key: str = api_key
         self.client: httpx.AsyncClient = httpx.AsyncClient(
@@ -497,9 +560,9 @@ class LLMClient:
             payload = {
                 "model": self.config["model"],
                 "messages": messages,
-                "temperature": self.config.get("temperature", 0.7),
-                "max_tokens": self.config.get("max_tokens", 4096),
-                "top_p": self.config.get("top_p", 1.0),
+                "temperature": self.config["temperature"],
+                "max_tokens": self.config["max_tokens"],
+                "top_p": self.config["top_p"],
             }
 
             if tools:
@@ -510,10 +573,17 @@ class LLMClient:
             result = response.json()
 
             choice = result["choices"][0]
+            # Validate choice index parameter from config
+            choice_index = self.config.get("choice_index")
+            if choice_index is None:
+                raise ValueError(
+                    "choice_index must be explicitly configured in LLM config"
+                )
+
             return {
                 "message": choice["message"],
                 "finish_reason": choice.get("finish_reason"),
-                "index": choice.get("index", 0),
+                "index": choice.get("index", choice_index),
                 "usage": result.get("usage"),
                 "model": result.get("model", self.config["model"]),
             }
@@ -549,9 +619,9 @@ class LLMClient:
             payload = {
                 "model": self.config["model"],
                 "messages": messages,
-                "temperature": self.config.get("temperature", 0.7),
-                "max_tokens": self.config.get("max_tokens", 4096),
-                "top_p": self.config.get("top_p", 1.0),
+                "temperature": self.config["temperature"],
+                "max_tokens": self.config["max_tokens"],
+                "top_p": self.config["top_p"],
                 "stream": True,
             }
 
@@ -664,15 +734,31 @@ def setup_mcp_clients(config: Configuration) -> list[MCPClient]:
     """Create and configure MCP clients from configuration."""
     config_path = os.path.join(os.path.dirname(__file__), "servers_config.json")
     servers_config = config.load_config(config_path)
+    # Get MCP connection and server execution configurations
     mcp_connection_config = config.get_mcp_connection_config()
+    server_execution_config = config.get_server_execution_config()
 
     clients = []
     for name, server_config in servers_config["mcpServers"].items():
-        # Only create clients for enabled servers
-        if server_config.get("enabled", False):
-            clients.append(MCPClient(name, server_config, mcp_connection_config))
-        else:
+        # Check if require_enabled_flag is set
+        if server_execution_config["require_enabled_flag"]:
+            # Only create clients for explicitly enabled servers
+            if "enabled" not in server_config:
+                raise ValueError(
+                    f"Server '{name}' must have explicit 'enabled' flag when "
+                    "require_enabled_flag is True"
+                )
+            if not server_config["enabled"]:
+                logging.info(f"Skipping disabled server: {name}")
+                continue
+        elif not server_config.get("enabled", True):
+            # Legacy mode - assume enabled if not specified
             logging.info(f"Skipping disabled server: {name}")
+            continue
+
+        clients.append(MCPClient(
+            name, server_config, mcp_connection_config, server_execution_config
+        ))
 
     return clients
 

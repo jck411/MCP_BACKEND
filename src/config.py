@@ -137,10 +137,20 @@ class Configuration:
         """Get the maximum number of tool hops allowed.
 
         Returns:
-            Maximum number of tool hops (default: 8).
+            Maximum number of tool hops.
+
+        Raises:
+            ValueError: If max_tool_hops is not configured or invalid.
         """
         service_config = self.get_chat_service_config()
-        max_hops = service_config.get("max_tool_hops", 8)
+
+        if "max_tool_hops" not in service_config:
+            raise ValueError(
+                "max_tool_hops must be explicitly configured in config.yaml "
+                "under chat.service"
+            )
+
+        max_hops = service_config["max_tool_hops"]
 
         # Validate that it's a positive integer
         if not isinstance(max_hops, int) or max_hops < 1:
@@ -152,17 +162,37 @@ class Configuration:
         """Get MCP connection configuration from YAML.
 
         Returns:
-            MCP connection configuration dictionary with validated defaults.
+            MCP connection configuration dictionary with validated values.
+
+        Raises:
+            ValueError: If required connection parameters are missing or invalid.
         """
         mcp_config = self._config.get("mcp", {})
         connection_config = mcp_config.get("connection", {})
 
-        # Get values with defaults
-        max_attempts = connection_config.get("max_reconnect_attempts", 5)
-        initial_delay = connection_config.get("initial_reconnect_delay", 1.0)
-        max_delay = connection_config.get("max_reconnect_delay", 30.0)
-        connection_timeout = connection_config.get("connection_timeout", 30.0)
-        ping_timeout = connection_config.get("ping_timeout", 10.0)
+        # Required configuration keys
+        required_keys = [
+            "max_reconnect_attempts",
+            "initial_reconnect_delay",
+            "max_reconnect_delay",
+            "connection_timeout",
+            "ping_timeout"
+        ]
+
+        # Check all required keys are present
+        for key in required_keys:
+            if key not in connection_config:
+                raise ValueError(
+                    f"{key} must be explicitly configured in config.yaml "
+                    f"under mcp.connection"
+                )
+
+        # Get values without defaults
+        max_attempts = connection_config["max_reconnect_attempts"]
+        initial_delay = connection_config["initial_reconnect_delay"]
+        max_delay = connection_config["max_reconnect_delay"]
+        connection_timeout = connection_config["connection_timeout"]
+        ping_timeout = connection_config["ping_timeout"]
 
         # Validate configuration values
         if max_attempts < 1:
@@ -188,59 +218,125 @@ class Configuration:
         """Get context management configuration from YAML.
 
         Returns:
-            Context configuration dictionary with validated defaults.
+            Context configuration dictionary with validated values.
+
+        Raises:
+            ValueError: If required context parameters are missing or invalid.
         """
         service_config = self.get_chat_service_config()
         context_config = service_config.get("context", {})
 
-        # Get values with defaults
-        max_tokens = context_config.get("max_tokens", 4000)
-        reserve_tokens = context_config.get("reserve_tokens", 500)
+        # Validate all required configuration sections exist
+        self._validate_context_config_structure(context_config)
 
-        # Conversation limits
-        limits = context_config.get("conversation_limits", {})
-        short_limit = limits.get("short", 100)
-        medium_limit = limits.get("medium", 500)
-        long_limit = limits.get("long", 1500)
+        # Extract and validate values
+        return self._build_context_config_dict(context_config)
 
-        # Response token estimates
-        response_tokens = context_config.get("response_tokens", {})
-        short_response = response_tokens.get("short", 150)
-        medium_response = response_tokens.get("medium", 300)
-        long_response = response_tokens.get("long", 500)
-        max_response = response_tokens.get("max", 800)
+    def _validate_context_config_structure(
+        self, context_config: dict[str, Any]
+    ) -> None:
+        """Validate that all required context configuration sections exist."""
+        # Check required top-level keys
+        required_keys = ["max_tokens", "reserve_tokens", "preserve_recent"]
+        for key in required_keys:
+            if key not in context_config:
+                raise ValueError(
+                    f"{key} must be explicitly configured in config.yaml "
+                    f"under chat.service.context"
+                )
 
-        # Optimization settings
-        preserve_recent = context_config.get("preserve_recent", 5)
+        # Check required nested sections
+        nested_sections = ["conversation_limits", "response_tokens"]
+        for section in nested_sections:
+            if section not in context_config:
+                raise ValueError(
+                    f"{section} must be explicitly configured in config.yaml "
+                    "under chat.service.context"
+                )
 
-        # Validate configuration values
-        if max_tokens < 1:
-            raise ValueError("max_tokens must be at least 1")
-        if reserve_tokens < 0:
-            raise ValueError("reserve_tokens must be non-negative")
-        if not (short_limit < medium_limit < long_limit):
-            raise ValueError("conversation_limits must be in ascending order")
-        if not (short_response <= medium_response <= long_response <= max_response):
-            raise ValueError("response_tokens must be in non-decreasing order")
-        if preserve_recent < 0:
-            raise ValueError("preserve_recent must be non-negative")
+        # Validate conversation_limits sub-keys
+        limits = context_config["conversation_limits"]
+        limits_required = ["short", "medium", "long"]
+        for key in limits_required:
+            if key not in limits:
+                raise ValueError(
+                    f"conversation_limits.{key} must be explicitly configured "
+                    "in config.yaml"
+                )
+
+        # Validate response_tokens sub-keys
+        response_tokens = context_config["response_tokens"]
+        response_required = ["short", "medium", "long", "max"]
+        for key in response_required:
+            if key not in response_tokens:
+                raise ValueError(
+                    f"response_tokens.{key} must be explicitly configured "
+                    "in config.yaml"
+                )
+
+    def _build_context_config_dict(
+        self, context_config: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Build and validate the context configuration dictionary."""
+        # Extract values
+        max_tokens = context_config["max_tokens"]
+        reserve_tokens = context_config["reserve_tokens"]
+        preserve_recent = context_config["preserve_recent"]
+
+        limits = context_config["conversation_limits"]
+        response_tokens = context_config["response_tokens"]
+
+        # Validate ranges and relationships
+        self._validate_context_config_values(
+            max_tokens, reserve_tokens, preserve_recent, limits, response_tokens
+        )
 
         return {
             "max_tokens": max_tokens,
             "reserve_tokens": reserve_tokens,
             "conversation_limits": {
-                "short": short_limit,
-                "medium": medium_limit,
-                "long": long_limit,
+                "short": limits["short"],
+                "medium": limits["medium"],
+                "long": limits["long"],
             },
             "response_tokens": {
-                "short": short_response,
-                "medium": medium_response,
-                "long": long_response,
-                "max": max_response,
+                "short": response_tokens["short"],
+                "medium": response_tokens["medium"],
+                "long": response_tokens["long"],
+                "max": response_tokens["max"],
             },
             "preserve_recent": preserve_recent,
         }
+
+    def _validate_context_config_values(
+        self,
+        max_tokens: int,
+        reserve_tokens: int,
+        preserve_recent: int,
+        limits: dict[str, Any],
+        response_tokens: dict[str, Any],
+    ) -> None:
+        """Validate context configuration values are within acceptable ranges."""
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be at least 1")
+        if reserve_tokens < 0:
+            raise ValueError("reserve_tokens must be non-negative")
+        if preserve_recent < 0:
+            raise ValueError("preserve_recent must be non-negative")
+
+        # Validate conversation limits are in ascending order
+        if not (limits["short"] < limits["medium"] < limits["long"]):
+            raise ValueError("conversation_limits must be in ascending order")
+
+        # Validate response tokens are in non-decreasing order
+        tokens = [
+            response_tokens["short"],
+            response_tokens["medium"],
+            response_tokens["long"],
+            response_tokens["max"]
+        ]
+        if not all(tokens[i] <= tokens[i + 1] for i in range(len(tokens) - 1)):
+            raise ValueError("response_tokens must be in non-decreasing order")
 
     def get_streaming_config(self) -> dict[str, Any]:
         """Get streaming configuration from YAML.
@@ -259,3 +355,73 @@ class Configuration:
         """
         service_config = self.get_chat_service_config()
         return service_config.get("tool_notifications", {})
+
+    def get_streaming_backoff_config(self) -> dict[str, Any]:
+        """Get streaming backoff configuration from YAML.
+
+        Returns:
+            Streaming backoff configuration dictionary.
+
+        Raises:
+            ValueError: If required streaming backoff parameters are missing.
+        """
+        service_config = self.get_chat_service_config()
+        streaming_config = service_config.get("streaming", {})
+        backoff_config = streaming_config.get("backoff", {})
+
+        # Required configuration keys
+        required_keys = ["max_attempts", "initial_delay", "flush_every_n_deltas"]
+        for key in required_keys:
+            if key not in backoff_config:
+                raise ValueError(
+                    f"streaming.backoff.{key} must be explicitly configured "
+                    "in config.yaml under chat.service.streaming.backoff"
+                )
+
+        return backoff_config
+
+    def get_server_execution_config(self) -> dict[str, Any]:
+        """Get server execution configuration from YAML.
+
+        Returns:
+            Server execution configuration dictionary.
+
+        Raises:
+            ValueError: If required server execution parameters are missing.
+        """
+        mcp_config = self._config.get("mcp", {})
+        server_config = mcp_config.get("server_execution", {})
+
+        # Required configuration keys
+        required_keys = ["default_args", "default_env", "require_enabled_flag"]
+        for key in required_keys:
+            if key not in server_config:
+                raise ValueError(
+                    f"mcp.server_execution.{key} must be explicitly configured "
+                    "in config.yaml"
+                )
+
+        return server_config
+
+    def get_chat_store_config(self) -> dict[str, Any]:
+        """Get chat store configuration from YAML.
+
+        Returns:
+            Chat store configuration dictionary.
+
+        Raises:
+            ValueError: If required chat store parameters are missing.
+        """
+        chat_store_config = self._config.get("chat_store", {})
+        visibility_config = chat_store_config.get("visibility", {})
+
+        # Required configuration keys
+        required_keys = ["system_updates_visible_to_llm", "default_visible_to_llm"]
+        for key in required_keys:
+            if key not in visibility_config:
+                raise ValueError(
+                    f"chat_store.visibility.{key} must be explicitly configured "
+                    "in config.yaml"
+                )
+
+        return chat_store_config
