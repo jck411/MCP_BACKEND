@@ -99,14 +99,13 @@ class MCPClient:
         """
         Resolve command configuration to absolute executable path with validation.
 
-        This internal method handles the complex task of finding executable commands
+        This internal method handles the task of finding executable commands
         across different operating systems and environments. It supports both absolute
         paths and commands that need to be resolved through the system PATH.
 
-        The method implements several resolution strategies:
+        The method implements two resolution strategies:
         1. Direct return for absolute paths (if they exist)
         2. PATH resolution using shutil.which for relative commands
-        3. Windows-specific workaround for npx/node compatibility issues
 
         This is critical for MCP server startup since many servers are distributed
         as npm packages or require specific runtime environments.
@@ -115,9 +114,9 @@ class MCPClient:
             str | None: Absolute path to executable if found, None if resolution fails
 
         Implementation Notes:
-            - Windows compatibility: Falls back to 'node' if 'npx' is not found
             - Only returns paths to files that actually exist on the filesystem
             - Does not validate that the file is executable (left to OS)
+            - No fallback logic - explicit command configuration is required
 
         Example:
             config = {"command": "python"}  # -> "/usr/bin/python"
@@ -132,17 +131,8 @@ class MCPClient:
         if os.path.isabs(command):
             return command if os.path.exists(command) else None
 
-        # Resolve through system PATH
-        resolved = shutil.which(command)
-
-        # Windows-specific npx compatibility workaround
-        if not resolved and command == "npx" and sys.platform == "win32":
-            node_path = shutil.which("node")
-            if node_path:
-                logging.warning("Using node instead of npx on Windows")
-                return node_path
-
-        return resolved
+        # Resolve through system PATH - no fallbacks
+        return shutil.which(command)
 
     async def connect(self) -> None:
         """

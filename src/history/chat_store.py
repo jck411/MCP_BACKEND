@@ -273,6 +273,34 @@ class ChatRepository(Protocol):
         """
         ...
 
+    async def add_events(self, events: list[ChatEvent]) -> bool:
+        """
+        Add multiple events to the repository in a batch operation.
+
+        Args:
+            events: List of ChatEvents to store
+
+        Returns:
+            bool: True if all events were added successfully
+        """
+        ...
+
+    async def event_exists(
+        self, conversation_id: str, event_type: str, request_id: str
+    ) -> bool:
+        """
+        Check if an event exists for a specific request.
+
+        Args:
+            conversation_id: ID of the conversation
+            event_type: Type of event to check for (e.g., "user_message")
+            request_id: The request ID to check
+
+        Returns:
+            bool: True if the event exists, False otherwise
+        """
+        ...
+
     async def get_events(
         self, conversation_id: str, limit: int | None = None
     ) -> list[ChatEvent]:
@@ -621,10 +649,12 @@ class AsyncJsonlRepo(ChatRepository):
                     if (event.type == "assistant_message" and
                         event.extra.get("user_request_id") == user_request_id):
                         return event
-                # Fallback if not found (shouldn't happen)
-                logger.warning(
-                    f"Assistant request_id {assistant_req_id} in set "
-                    f"but event not found"
+                # FAIL FAST: Inconsistent state detected
+                raise ValueError(
+                    f"Data corruption detected: Assistant request_id "
+                    f"{assistant_req_id} exists in index but corresponding event "
+                    f"not found in conversation {conversation_id}. This indicates "
+                    f"a corrupted repository state that must be fixed."
                 )
 
             # Remove all delta events for this user_request_id
@@ -665,6 +695,112 @@ class AsyncJsonlRepo(ChatRepository):
             asst_cache[user_request_id] = assistant_event.id
 
             return assistant_event
+
+    async def add_events(self, events: list[ChatEvent]) -> bool:
+        """
+        Add multiple events to the repository in a batch operation.
+
+        This method provides efficient bulk insertion with cross-process locking
+        and maintains consistency with the single event add operation.
+
+        Args:
+            events: List of ChatEvents to store
+
+        Returns:
+            bool: True if all events were added successfully
+        """
+        await self._ensure_loaded()
+
+        if not events:
+            return True
+
+        async with self._lock:
+            # Process each event similar to add_event but without individual writes
+            processed_events = []
+
+            for event in events:
+                # Check for duplicate by request_id if present
+                request_id = event.extra.get("request_id")
+                if request_id:
+                    req_ids = self._req_ids.setdefault(event.conversation_id, set())
+                    if request_id in req_ids:
+                        continue  # Skip duplicate
+
+                # Assign sequence number
+                event.seq = self._get_next_seq(event.conversation_id)
+
+                # Add to in-memory structures
+                conv_events = self._by_conv.setdefault(event.conversation_id, [])
+                conv_events.append(event)
+                processed_events.append(event)
+
+                # Update request_id tracking
+                if request_id:
+                    req_ids.add(request_id)
+                    req_map = self._req_id_to_event.setdefault(
+                        event.conversation_id, {}
+                    )
+                    req_map[request_id] = event
+
+                # Cache assistant IDs for O(1) lookup
+                if (event.type == "assistant_message" and
+                    event.extra.get("user_request_id")):
+                    asst_cache = self._last_assistant_ids.setdefault(
+                        event.conversation_id, {}
+                    )
+                    asst_cache[event.extra["user_request_id"]] = event.id
+
+            # Batch write to file
+            if processed_events:
+                await self._append_events_async(processed_events)
+
+            return True
+
+    async def _append_events_async(self, events: list[ChatEvent]) -> None:
+        """
+        Asynchronously append multiple events to the JSONL file with crash safety.
+
+        Args:
+            events: List of ChatEvents to persist to disk
+        """
+        async with (
+            async_file_lock(self.path),
+            aiofiles.open(self.path, "a", encoding="utf-8") as f,
+        ):
+            for event in events:
+                data = json.dumps(
+                    event.model_dump(mode="json"), ensure_ascii=False
+                )
+                await f.write(data + "\n")
+            await f.flush()
+            # Force data to persistent storage for maximum durability
+            if self.fsync_enabled:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, os.fsync, f.fileno())
+
+    async def event_exists(
+        self, conversation_id: str, event_type: str, request_id: str  # noqa: ARG002
+    ) -> bool:
+        """
+        Check if an event exists for a specific request.
+
+        Args:
+            conversation_id: ID of the conversation
+            event_type: Type of event to check for (e.g., "user_message")
+            request_id: The request ID to check
+
+        Returns:
+            bool: True if the event exists, False otherwise
+
+        Note:
+            Currently uses request_id for O(1) lookup regardless of event_type.
+            Future implementations may filter by event_type for more specificity.
+        """
+        await self._ensure_loaded()
+
+        async with self._lock:
+            req_ids = self._req_ids.get(conversation_id, set())
+            return request_id in req_ids
 
 
 # ---------- Demo Script ----------

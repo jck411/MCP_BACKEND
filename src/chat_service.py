@@ -1,11 +1,12 @@
 """
-Chat Service for MCP Platform
+Chat Service for MCP Platform - REVISED 2025-08-02
 
 This module handles the business logic for chat sessions, including:
 - Conversation management with simple default prompts
 - Tool orchestration
 - MCP client coordination
 - LLM interactions
+- File lock contention handling with exponential backoff
 """
 
 from __future__ import annotations
@@ -13,22 +14,59 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
+from collections import defaultdict
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any
 
-from mcp import types
+from mcp import McpError, types
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.config import Configuration
 from src.history.chat_store import ChatEvent, Usage
 from src.history.conversation_utils import build_conversation_with_token_limit
 
-if TYPE_CHECKING:
+if TYPE_CHECKING:                                        # pragma: no cover
     from src.tool_schema_manager import ToolSchemaManager
 else:
     from src.tool_schema_manager import ToolSchemaManager
 
+
 logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Utility helpers                                                             #
+# --------------------------------------------------------------------------- #
+_MAX_BACKOFF_ATTEMPTS = 5
+_INITIAL_BACKOFF      = 0.05      # seconds
+_FLUSH_EVERY_N_DELTAS = 25        # tune to taste
+
+
+async def _write_with_backoff(coro_func):
+    """
+    Execute a coroutine function that *writes* to the repo and retry with exponential
+    back-off if it raises a file-lock exception.
+
+    Args:
+        coro_func: A callable that returns a coroutine when called
+
+    Assumes the exception message contains `'events.jsonl.lock'`.
+    """
+    for attempt in range(_MAX_BACKOFF_ATTEMPTS):
+        try:
+            return await coro_func()
+        except (OSError, RuntimeError) as e:
+            msg = str(e)
+            if "events.jsonl.lock" not in msg:
+                raise                                 # unrelated problem
+            sleep = _INITIAL_BACKOFF * (2 ** attempt) + random.random() * 0.02
+            logger.debug(
+                f"File-lock contention detected - retry {attempt+1}/"
+                f"{_MAX_BACKOFF_ATTEMPTS} in {sleep:.2f}s"
+            )
+            await asyncio.sleep(sleep)
+    # last try
+    return await coro_func()
 
 
 class ToolCallContext(BaseModel):
@@ -89,6 +127,13 @@ class ChatService:
         self._init_lock = asyncio.Lock()
         self._ready = asyncio.Event()
         self._resource_catalog: list[str] = []  # Initialize resource catalog
+
+        # *NEW* - per-conversation locks to serialise writes
+        self._conv_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+    # helper - returns the lock object (always the same instance per conv-id)
+    def _conv_lock(self, conv_id: str) -> asyncio.Lock:
+        return self._conv_locks[conv_id]
 
     async def initialize(self) -> None:
         """Initialize the chat service and all MCP clients."""
@@ -153,38 +198,30 @@ class ChatService:
         request_id: str,
     ) -> AsyncGenerator[ChatMessage]:
         """
-        Process a user message with consistent history management and delta persistence.
-
-        Flow:
-        1. Persist user message first (with idempotency check)
-        2. Build history from repository
-        3. Stream response while persisting deltas
-        4. Compact deltas into final assistant message
+        Streaming entry-point - now *serialised per conversation*.
         """
         await self._ready.wait()
         self._validate_streaming_support()
 
-        # Handle idempotency and user message persistence
-        should_continue = await self._handle_user_message_persistence(
-            conversation_id, user_msg, request_id
-        )
-        if not should_continue:
-            async for msg in self._yield_existing_response(conversation_id, request_id):
+        async with self._conv_lock(conversation_id):          # NEW 🔒
+            should_continue = await self._handle_user_message_persistence(
+                conversation_id, user_msg, request_id
+            )
+            if not should_continue:
+                async for msg in self._yield_existing_response(
+                    conversation_id, request_id
+                ):
+                    yield msg
+                return
+
+            conv = await self._build_conversation_history(conversation_id, user_msg)
+            assert self.tool_mgr is not None
+            tools_payload = self.tool_mgr.get_openai_tools()
+
+            async for msg in self._stream_and_handle_tools(
+                conv, tools_payload, conversation_id, request_id
+            ):
                 yield msg
-            return
-
-        # Build conversation and generate response
-        conv = await self._build_conversation_history(conversation_id, user_msg)
-
-        # Type assertion: tool_mgr is guaranteed non-None after validation
-        assert self.tool_mgr is not None
-        tools_payload = self.tool_mgr.get_openai_tools()
-
-        # Stream and handle tool calls
-        async for msg in self._stream_and_handle_tools(
-            conv, tools_payload, conversation_id, request_id
-        ):
-            yield msg
 
     def _validate_streaming_support(self) -> None:
         """
@@ -211,44 +248,33 @@ class ChatService:
         self, conversation_id: str, user_msg: str, request_id: str
     ) -> bool:
         """
-        Handle user message persistence with simplified idempotency checks.
-
-        This method now persists the user message first and then performs a single
-        check for an existing assistant response.  If an assistant response already
-        exists for this request, it returns False so that the cached response can
-        be returned.  Otherwise it returns True to continue processing.
-
-        Args:
-            conversation_id: The conversation identifier
-            user_msg: The user's message content
-            request_id: Unique identifier for this request (used for idempotency)
-
-        Returns:
-            bool: True if processing should continue (new request), False if response
-                  already exists (cached response should be returned)
+        *First* look for an assistant reply for this request_id.  If found we
+        can immediately return cached output without touching disk.
         """
-        # Create user event and persist it.  If this is a duplicate request ID,
-        # the repo will return False and not store another user event.
+        existing = await self._get_existing_assistant_response(
+            conversation_id, request_id
+        )
+        if existing:
+            return False                           # tell caller to use cache
+
+        # If somebody else is *currently* working on the same request we might
+        # already have the user event.
+        if await self.repo.event_exists(
+            conversation_id, "user_message", request_id
+        ):
+            return True                            # proceed - assistant not done yet
+
+        # Otherwise persist the user message (single write)
         user_ev = ChatEvent(
             conversation_id=conversation_id,
-            seq=0,  # Will be assigned by repository
+            seq=0,
             type="user_message",
             role="user",
             content=user_msg,
             extra={"request_id": request_id},
         )
         user_ev.compute_and_cache_tokens()
-        _ = await self.repo.add_event(user_ev)
-
-        # After persisting (or detecting duplicate), check once for an existing
-        # response.
-        existing_response = await self._get_existing_assistant_response(
-            conversation_id, request_id
-        )
-        if existing_response:
-            logger.info(f"Returning cached response for request_id: {request_id}")
-            return False
-
+        await _write_with_backoff(lambda: self.repo.add_event(user_ev))
         return True
 
     async def _yield_existing_response(
@@ -345,13 +371,13 @@ class ChatService:
                 yield msg
 
         # Final compaction
-        await self.repo.compact_deltas(
+        await _write_with_backoff(lambda: self.repo.compact_deltas(
             conversation_id,
             request_id,
             full_content,
             usage=self._convert_usage(None),
             model=self.llm_client.config.get("model", "")
-        )
+        ))
 
     def _log_initial_response(self, assistant_msg: dict[str, Any]) -> None:
         """
@@ -432,87 +458,90 @@ class ChatService:
         hop_number: int = 0
     ) -> AsyncGenerator[ChatMessage | dict[str, Any]]:
         """
-        Stream response from LLM, persist deltas, and yield chunks to user.
-
-        Key behavior: Message content streams immediately to user while tool calls
-        are accumulated in the background for efficient execution.
+        Identical user-facing behaviour, but we persist deltas **in batches**
+        to avoid hammering the jsonl lock.
         """
-        message_buffer = ""
+        message_buffer: str = ""
         current_tool_calls: list[dict[str, Any]] = []
-        finish_reason: str | None = None
-        delta_index = 0  # Track delta order for proper reconstruction
+        pending_deltas: list[ChatEvent] = []
+        flush_count: int = 0
 
-        # Stream from LLM API - this is where the real-time magic happens
+        async def _flush():
+            nonlocal pending_deltas, flush_count
+            if not pending_deltas:
+                return
+            flush_count += 1
+            batch = pending_deltas
+            pending_deltas = []
+            # Use bulk write method
+            await _write_with_backoff(lambda: self.repo.add_events(batch))
+
+        delta_index = 0
+        finish_reason: str | None = None
+
         async for chunk in self.llm_client.get_streaming_response_with_tools(
             conv, tools_payload
         ):
-            # Skip malformed chunks (defensive programming)
             if "choices" not in chunk or not chunk["choices"]:
                 continue
 
             choice = chunk["choices"][0]
-            delta = choice.get("delta", {})
+            delta  = choice.get("delta", {})
 
-            # PRIORITY 1: Stream content immediately to provide responsive UX
-            # Content deltas are the most time-sensitive part of the response
+            # --- 1. content ------------------------------------------------
             if content := delta.get("content"):
-                message_buffer += content  # Build complete message for final storage
-
-                # Persist this content delta for history reconstruction
-                # Each delta gets a unique index for proper ordering
-                delta_event = ChatEvent(
-                    conversation_id=conversation_id,
-                    seq=0,  # Repository will assign sequence number
-                    type="meta",  # Internal event type for system operations
-                    content=content,
-                    extra={
-                        "kind": "assistant_delta",  # Specific delta type identifier
-                        "user_request_id": user_request_id,  # Link to request
-                        "hop_number": hop_number,  # Track tool call iteration depth
-                        "delta_index": delta_index,  # Preserve streaming order
-                        "request_id": user_request_id  # Redundant for easier queries
-                    }
+                message_buffer += content
+                pending_deltas.append(
+                    ChatEvent(
+                        conversation_id=conversation_id,
+                        seq=0,
+                        type="meta",
+                        content=content,
+                        extra={
+                            "kind": "assistant_delta",
+                            "user_request_id": user_request_id,
+                            "hop_number": hop_number,
+                            "delta_index": delta_index,
+                            "request_id": user_request_id,
+                        },
+                    )
                 )
-                await self.repo.add_event(delta_event)
-                delta_index += 1  # Increment for next delta
-
-                # IMMEDIATE USER FEEDBACK: Stream to user without waiting
-                # This is what makes the UI feel responsive during long responses
+                delta_index += 1
                 yield ChatMessage(
-                    type="text",
-                    content=content,
+                    type="text", content=content,
                     metadata={"type": "delta", "hop": hop_number}
                 )
 
-            # PRIORITY 2: Accumulate tool calls for batch execution
-            # Tool calls need to be complete before execution, so we buffer them
+            # --- 2. tool-call deltas ---------------------------------------
             if tool_calls := delta.get("tool_calls"):
-                # Use robust accumulation that handles out-of-order and partial deltas
                 self._accumulate_tool_calls(current_tool_calls, tool_calls)
 
-            # PRIORITY 3: Track completion status for proper flow control
             if "finish_reason" in choice:
                 finish_reason = choice["finish_reason"]
 
-        # Provide user feedback when transitioning to tool execution phase
-        # This helps users understand what's happening during longer operations
-        if current_tool_calls and any(
-            call["function"]["name"] for call in current_tool_calls
-        ):
+            # flush periodically
+            if len(pending_deltas) >= _FLUSH_EVERY_N_DELTAS:
+                await _flush()
+
+        await _flush()                    # final flush
+
+        if (current_tool_calls and
+            any(c["function"]["name"] for c in current_tool_calls)):
             yield ChatMessage(
                 type="tool_execution",
                 content=f"Executing {len(current_tool_calls)} tool(s)...",
-                metadata={"tool_count": len(current_tool_calls), "hop": hop_number}
+                metadata={"tool_count": len(current_tool_calls), "hop": hop_number},
             )
 
-        # Return complete assistant message for tool call processing
-        # This allows the caller to determine if more LLM interactions are needed
         yield {
             "content": message_buffer or None,
-            "tool_calls": current_tool_calls if current_tool_calls and any(
-                call["function"]["name"] for call in current_tool_calls
-            ) else None,
-            "finish_reason": finish_reason
+            "tool_calls": (
+                current_tool_calls
+                if (current_tool_calls and
+                    any(c["function"]["name"] for c in current_tool_calls))
+                else None
+            ),
+            "finish_reason": finish_reason,
         }
 
     def _accumulate_tool_calls(
@@ -607,8 +636,8 @@ class ChatService:
         sequentially, validates the JSON arguments, executes the tool through the
         tool manager, and formats the results for inclusion in the conversation.
 
-        The method implements several important behaviors:
-        1. Parses JSON arguments with fallback to empty dict for malformed JSON
+        The method implements fail-fast behavior:
+        1. Parses JSON arguments with strict validation - fails on malformed JSON
         2. Executes tools through the tool manager (which handles validation)
         3. Extracts content from MCP CallToolResult using _pluck_content helper
         4. Appends tool results to conversation in OpenAI chat format
@@ -622,6 +651,9 @@ class ChatService:
             - Executes external tool calls through MCP clients
             - May raise exceptions if tool execution fails (handled by caller)
 
+        Raises:
+            json.JSONDecodeError: If tool call arguments contain invalid JSON
+
         Note:
             Tool calls are executed sequentially, not in parallel. This ensures
             deterministic execution order and prevents resource conflicts between tools.
@@ -630,8 +662,19 @@ class ChatService:
 
         for call in calls:
             tool_name = call["function"]["name"]
-            # Parse JSON arguments with defensive handling for malformed JSON
-            args = json.loads(call["function"]["arguments"] or "{}")
+            # Parse JSON arguments with strict validation - fail fast on malformed JSON
+            try:
+                args = json.loads(call["function"]["arguments"] or "{}")
+            except json.JSONDecodeError as e:
+                raise McpError(
+                    error=types.ErrorData(
+                        code=types.INVALID_PARAMS,
+                        message=(
+                            f"Invalid JSON in tool call arguments for "
+                            f"{tool_name}: {e}"
+                        ),
+                    )
+                ) from e
 
             # Execute tool through tool manager (handles validation and routing)
             result = await self.tool_mgr.call_tool(tool_name, args)
@@ -670,87 +713,77 @@ class ChatService:
     ) -> ChatEvent:
         """
         Non-streaming chat with consistent history management.
-        
+
         Flow:
         1. Persist user message first (with idempotency check)
         2. Build history from repository
         3. Generate response with tools
         4. Persist final assistant message
-        """  # noqa: W293
+        """
         await self._ready.wait()
 
         if not self.tool_mgr:
             raise RuntimeError("Tool manager not initialized")
 
-        # Check for existing response to prevent double-billing
-        existing_response = await self._get_existing_assistant_response(
-            conversation_id, request_id
-        )
-        if existing_response:
-            logger.info(
-                f"Returning cached response for request_id: {request_id}"
-            )
-            return existing_response
-
-        # 1) persist user message FIRST with idempotency check
-        user_ev = ChatEvent(
-            conversation_id=conversation_id,
-            seq=0,  # Will be assigned by repository
-            type="user_message",
-            role="user",
-            content=user_msg,
-            extra={"request_id": request_id},
-        )
-        # Ensure token count is computed
-        user_ev.compute_and_cache_tokens()
-        was_added = await self.repo.add_event(user_ev)
-
-        if not was_added:
-            # User message already exists, check for assistant response again
+        async with self._conv_lock(conversation_id):          # NEW 🔒
+            # Check for existing response to prevent double-billing
             existing_response = await self._get_existing_assistant_response(
                 conversation_id, request_id
             )
             if existing_response:
                 logger.info(
-                    "Returning existing response for duplicate "
-                    f"request_id: {request_id}"
+                    f"Returning cached response for request_id: {request_id}"
                 )
                 return existing_response
-            # No assistant response yet, continue with LLM call
 
-        # 2) build canonical history from repo
-        events = await self.repo.last_n_tokens(conversation_id, self.ctx_window)
-        conv, _ = build_conversation_with_token_limit(
-            self._system_prompt,
-            events,
-            user_msg,
-            self.ctx_window,
-            self.reserve_tokens  # Use configured reserve tokens
-        )
+            # persist user message only if it does *not* exist yet
+            if not await self.repo.event_exists(
+                conversation_id, "user_message", request_id
+            ):
+                user_ev = ChatEvent(
+                    conversation_id=conversation_id,
+                    seq=0,
+                    type="user_message",
+                    role="user",
+                    content=user_msg,
+                    extra={"request_id": request_id},
+                )
+                user_ev.compute_and_cache_tokens()
+                await _write_with_backoff(lambda: self.repo.add_event(user_ev))
 
-        # 4) Generate assistant response with usage tracking
-        (
-            assistant_full_text,
-            total_usage,
-            model
-        ) = await self._generate_assistant_response(conv)
+            # 2) build canonical history from repo
+            events = await self.repo.last_n_tokens(conversation_id, self.ctx_window)
+            conv, _ = build_conversation_with_token_limit(
+                self._system_prompt,
+                events,
+                user_msg,
+                self.ctx_window,
+                self.reserve_tokens  # Use configured reserve tokens
+            )
 
-        # 5) persist assistant message with usage and reference to user request
-        assistant_ev = ChatEvent(
-            conversation_id=conversation_id,
-            seq=0,  # Will be assigned by repository
-            type="assistant_message",
-            role="assistant",
-            content=assistant_full_text,
-            usage=total_usage,
-            model=model,
-            extra={"user_request_id": request_id},
-        )
-        # Ensure token count is computed
-        assistant_ev.compute_and_cache_tokens()
-        await self.repo.add_event(assistant_ev)
+            # 4) Generate assistant response with usage tracking
+            (
+                assistant_full_text,
+                total_usage,
+                model
+            ) = await self._generate_assistant_response(conv)
 
-        return assistant_ev
+            # 5) persist assistant message with usage and reference to user request
+            assistant_ev = ChatEvent(
+                conversation_id=conversation_id,
+                seq=0,  # Will be assigned by repository
+                type="assistant_message",
+                role="assistant",
+                content=assistant_full_text,
+                usage=total_usage,
+                model=model,
+                extra={"user_request_id": request_id},
+            )
+            # Ensure token count is computed
+            assistant_ev.compute_and_cache_tokens()
+            await _write_with_backoff(lambda: self.repo.add_event(assistant_ev))
+
+            return assistant_ev
 
     def _convert_usage(self, api_usage: dict[str, Any] | None) -> Usage:
         """
@@ -920,13 +953,14 @@ class ChatService:
         """
         Extract readable content from MCP CallToolResult for conversation context.
 
-        This internal method handles the complex task of converting MCP tool results
+        This internal method handles the task of converting MCP tool results
         into plain text suitable for inclusion in LLM conversation context. MCP tool
         results can contain various content types (text, images, binary data, embedded
         resources) that need different handling strategies.
 
-        The method implements a fallback chain:
-        1. Handle structured content (if present) by JSON serialization
+        The method implements fail-fast processing:
+        1. Handle structured content (if present) by JSON serialization with
+           strict validation
         2. Process each content item based on its type:
            - TextContent: Extract text directly
            - ImageContent: Create descriptive placeholder
@@ -945,19 +979,26 @@ class ChatService:
         Returns:
             str: Human-readable text representation of the tool result content
 
+        Raises:
+            McpError: If structured content cannot be serialized to JSON
+
         Side Effects:
-            - May log warnings if structured content serialization fails
             - Does not modify the input result object
         """
         if not res.content:
             return "✓ done"
 
-        # Handle structured content with graceful fallback
+        # Handle structured content with strict validation
         if hasattr(res, "structuredContent") and res.structuredContent:
             try:
                 return json.dumps(res.structuredContent, indent=2)
             except Exception as e:
-                logger.warning(f"Failed to serialize structured content: {e}")
+                raise McpError(
+                    error=types.ErrorData(
+                        code=types.INTERNAL_ERROR,
+                        message=f"Failed to serialize structured content: {e}",
+                    )
+                ) from e
 
         # Extract text from each piece of content
         out: list[str] = []
