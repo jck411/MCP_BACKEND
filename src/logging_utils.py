@@ -65,10 +65,10 @@ class MCPErrorHandler:
             return error.error.code, "mcp_error"
         if isinstance(error, ValidationError):
             return types.INVALID_PARAMS, "validation_error"
-        if isinstance(error, ConnectionError | OSError):
-            return types.INTERNAL_ERROR, "connection_error"
         if isinstance(error, TimeoutError):
             return types.INTERNAL_ERROR, "timeout_error"
+        if isinstance(error, ConnectionError | OSError):
+            return types.INTERNAL_ERROR, "connection_error"
         if isinstance(error, ValueError | TypeError):
             return types.INVALID_PARAMS, "parameter_error"
         return types.INTERNAL_ERROR, "unknown_error"
@@ -347,7 +347,7 @@ def log_mcp_operation(operation: str, **kwargs) -> Callable:
         k: v for k, v in kwargs.items()
         if k in ["context", "custom_message", "reraise_mcp_errors"]
     }
-    
+
     def decorator(func):
         return handle_mcp_errors(operation, **error_kwargs)(
             log_operation(operation, **log_kwargs)(func)

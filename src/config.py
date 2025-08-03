@@ -444,25 +444,40 @@ class Configuration:
         service_config = chat_config.get("service", {})
         repo_config = service_config.get("repository", {})
 
-        # Set defaults for backward compatibility
-        if "persistence" not in repo_config:
-            repo_config["persistence"] = {
-                "enabled": True,
-                "retention_policy": "token_limit",
-                "max_tokens_per_conversation": 8000,
-                "max_messages_per_conversation": 100,
-                "retention_days": 30,
-                "clear_on_startup": False
-            }
+        # Create new dictionary without mutating the original
+        result_config = {**repo_config}
 
-        # Validate persistence configuration
-        persistence_config = repo_config["persistence"]
+        # Require explicit persistence configuration
+        if "persistence" not in result_config:
+            raise ValueError(
+                "repository.persistence must be explicitly configured in config.yaml "
+                "under chat.service.repository.persistence"
+            )
+
+        # Validate required persistence keys
+        persistence_config = result_config["persistence"]
+        required_keys = [
+            "enabled",
+            "retention_policy",
+            "max_tokens_per_conversation",
+            "max_messages_per_conversation",
+            "retention_days",
+            "clear_on_startup"
+        ]
+
+        for key in required_keys:
+            if key not in persistence_config:
+                raise ValueError(
+                    f"repository.persistence.{key} must be explicitly configured "
+                    "in config.yaml"
+                )
+
+        # Validate persistence configuration values
         valid_policies = ["token_limit", "message_count", "time_based", "unlimited"]
-
         if persistence_config["retention_policy"] not in valid_policies:
             raise ValueError(
                 "repository.persistence.retention_policy must be one of: "
                 f"{valid_policies}"
             )
 
-        return repo_config
+        return result_config
