@@ -759,8 +759,8 @@ def setup_mcp_clients(config: Configuration) -> list[MCPClient]:
             if not server_config["enabled"]:
                 logging.info(f"Skipping disabled server: {name}")
                 continue
-        elif not server_config.get("enabled", True):
-            # Legacy mode - assume enabled if not specified
+        elif not server_config.get("enabled", False):
+            # Require explicit enabled flag in all configurations
             logging.info(f"Skipping disabled server: {name}")
             continue
 

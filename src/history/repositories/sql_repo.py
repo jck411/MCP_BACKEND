@@ -715,45 +715,24 @@ class AsyncSqlRepo(ChatRepository):
 
     def _row_to_event(self, row: Any) -> ChatEvent:
         """
-        Convert a database row (Row or tuple) into a ChatEvent instance.
+        Convert a database row into a ChatEvent instance.
         """
-        # Convert Row to tuple for consistent access
-        if hasattr(row, '__getitem__'):
-            # Both Row and tuple support indexing
-            (
-                id_,
-                conversation_id,
-                seq,
-                timestamp,
-                type_,
-                role,
-                content,
-                tool_calls,
-                tool_call_id,
-                model,
-                usage,
-                extra,
-                token_count,
-                request_id,
-            ) = (row[i] for i in range(14))
-        else:
-            # Fallback for direct tuple unpacking
-            (
-                id_,
-                conversation_id,
-                seq,
-                timestamp,
-                type_,
-                role,
-                content,
-                tool_calls,
-                tool_call_id,
-                model,
-                usage,
-                extra,
-                token_count,
-                request_id,
-            ) = row
+        (
+            id_,
+            conversation_id,
+            seq,
+            timestamp,
+            type_,
+            role,
+            content,
+            tool_calls,
+            tool_call_id,
+            model,
+            usage,
+            extra,
+            token_count,
+            request_id,
+        ) = (row[i] for i in range(14))
         return ChatEvent(
             id=id_,
             conversation_id=conversation_id,
