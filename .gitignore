@@ -64,6 +64,17 @@ coverage.xml
 # UV
 .uv/
 
+# Database files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Runtime files
+*.pid
+*.sock
+
 # Temporary files
 *.tmp
 *.temp
