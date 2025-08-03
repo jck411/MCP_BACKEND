@@ -72,6 +72,14 @@ class ChatRepository(Protocol):
         """
         ...
 
+    async def get_event_by_id(
+        self, conversation_id: str, event_id: str
+    ) -> ChatEvent | None:
+        """
+        Retrieve a specific event by its ID within a conversation.
+        """
+        ...
+
     async def compact_deltas(
         self,
         conversation_id: str,

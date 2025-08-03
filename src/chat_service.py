@@ -680,10 +680,10 @@ class ChatService:
             conversation_id, request_id
         )
         if existing_assistant_id:
-            events = await self.repo.get_events(conversation_id)
-            for event in events:
-                if event.id == existing_assistant_id:
-                    return event
+            # Use efficient get_event_by_id method instead of scanning all events
+            return await self.repo.get_event_by_id(
+                conversation_id, existing_assistant_id
+            )
         return None
 
     async def chat_once(

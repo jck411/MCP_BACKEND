@@ -455,6 +455,32 @@ class AsyncSqlRepo(ChatRepository):
             await cursor.close()
         return None
 
+    async def get_event_by_id(
+        self, conversation_id: str, event_id: str
+    ) -> ChatEvent | None:
+        """
+        Retrieve a specific event by its ID within a conversation.
+
+        This method provides direct access to a single event without needing
+        to scan through all events in the conversation, significantly improving
+        performance for cached response retrieval.
+        """
+        await self._initialize()
+
+        # If persistence is disabled, return None
+        if not self.persistence_config["enabled"]:
+            return None
+
+        async with self._connection_lock, aiosqlite.connect(self.db_path) as db:
+            await db.execute("PRAGMA busy_timeout=30000")
+            cursor = await db.execute(
+                "SELECT * FROM chat_events WHERE conversation_id = ? AND id = ?",
+                (conversation_id, event_id)
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return self._row_to_event(row) if row else None
+
     async def compact_deltas(
         self,
         conversation_id: str,
