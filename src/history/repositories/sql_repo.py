@@ -144,7 +144,6 @@ class AsyncSqlRepo(ChatRepository):
 
     async def clear_all_conversations(self) -> None:
         """Clear all conversation data from the database."""
-        await self._initialize()
         if not self._connection:
             raise RuntimeError("Database connection not available")
 
@@ -312,62 +311,61 @@ class AsyncSqlRepo(ChatRepository):
 
         async with self._connection_lock:
             try:
-                async with self._connection.execute("BEGIN"):
-                    # Group events by conversation for sequence assignment
-                    conv_events: dict[str, list[ChatEvent]] = {}
-                    for event in events:
-                        conv_events.setdefault(event.conversation_id, []).append(event)
+                # Group events by conversation for sequence assignment
+                conv_events: dict[str, list[ChatEvent]] = {}
+                for event in events:
+                    conv_events.setdefault(event.conversation_id, []).append(event)
 
-                    # Assign sequence numbers per conversation
-                    for conv_id, conv_event_list in conv_events.items():
-                        # Get current max sequence for this conversation
-                        cursor = await self._connection.execute("""
-                            SELECT COALESCE(MAX(seq), 0)
-                            FROM chat_events
-                            WHERE conversation_id = ?
-                        """, (conv_id,))
-                        result = await cursor.fetchone()
-                        await cursor.close()
-                        current_max = result[0] if result else 0
+                # Assign sequence numbers per conversation
+                for conv_id, conv_event_list in conv_events.items():
+                    # Get current max sequence for this conversation
+                    cursor = await self._connection.execute("""
+                        SELECT COALESCE(MAX(seq), 0)
+                        FROM chat_events
+                        WHERE conversation_id = ?
+                    """, (conv_id,))
+                    result = await cursor.fetchone()
+                    await cursor.close()
+                    current_max = result[0] if result else 0
 
-                        # Assign sequential numbers
-                        for i, event in enumerate(conv_event_list):
-                            if event.seq is None or event.seq == 0:
-                                event.seq = current_max + i + 1
+                    # Assign sequential numbers
+                    for i, event in enumerate(conv_event_list):
+                        if event.seq is None or event.seq == 0:
+                            event.seq = current_max + i + 1
 
-                    # Insert all events
-                    for event in events:
-                        request_id = event.extra.get("request_id")
-                        content_str = self._serialize_content(event.content)
-                        tool_calls_str = json.dumps([
-                            tc.model_dump() for tc in (event.tool_calls or [])
-                        ])
-                        usage_str = json.dumps(
-                            event.usage.model_dump() if event.usage else None
-                        )
+                # Insert all events
+                for event in events:
+                    request_id = event.extra.get("request_id")
+                    content_str = self._serialize_content(event.content)
+                    tool_calls_str = json.dumps([
+                        tc.model_dump() for tc in (event.tool_calls or [])
+                    ])
+                    usage_str = json.dumps(
+                        event.usage.model_dump() if event.usage else None
+                    )
 
-                        await self._connection.execute("""
-                            INSERT INTO chat_events (
-                                id, conversation_id, seq, timestamp, type, role,
-                                content, tool_calls, tool_call_id, model, usage,
-                                extra, token_count, request_id
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            event.id,
-                            event.conversation_id,
-                            event.seq,
-                            event.timestamp.isoformat(),
-                            event.type,
-                            event.role,
-                            content_str,
-                            tool_calls_str,
-                            event.tool_call_id,
-                            event.model,
-                            usage_str,
-                            json.dumps(event.extra),
-                            event.token_count,
-                            request_id,
-                        ))
+                    await self._connection.execute("""
+                        INSERT INTO chat_events (
+                            id, conversation_id, seq, timestamp, type, role,
+                            content, tool_calls, tool_call_id, model, usage,
+                            extra, token_count, request_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        event.id,
+                        event.conversation_id,
+                        event.seq,
+                        event.timestamp.isoformat(),
+                        event.type,
+                        event.role,
+                        content_str,
+                        tool_calls_str,
+                        event.tool_call_id,
+                        event.model,
+                        usage_str,
+                        json.dumps(event.extra),
+                        event.token_count,
+                        request_id,
+                    ))
                 await self._connection.commit()
                 return True
             except aiosqlite.IntegrityError:

@@ -17,9 +17,6 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-# Cache for token counts - maps content hash to token count
-_token_cache: dict[str, int] = {}
-
 # Default model encoding (OpenAI's default tokenizer)
 DEFAULT_ENCODING = "cl100k_base"  # Used by GPT-4, GPT-3.5-turbo
 
@@ -54,6 +51,34 @@ def _get_encoding(encoding_name: str) -> tiktoken.Encoding:
     return tiktoken.get_encoding(encoding_name)
 
 
+@lru_cache(maxsize=1024)  # Cache token counts with automatic eviction
+def _count_tokens_cached(_content_hash: str, encoding_name: str, text: str) -> int:
+    """
+    Count tokens with LRU caching to prevent unbounded memory growth.
+
+    This function replaces the global _token_cache dictionary with a bounded
+    LRU cache that automatically evicts old entries when the cache reaches
+    its maximum size of 1024 entries.
+
+    Args:
+        _content_hash: SHA256 hash of encoding_name:text for cache key uniqueness
+        encoding_name: Name of the tiktoken encoding to use
+        text: The text to count tokens for
+
+    Returns:
+        Number of tokens in the text
+
+    Note:
+        The _content_hash parameter ensures cache key uniqueness across different
+        encodings and prevents hash collisions. The text parameter is needed
+        for actual token counting when cache misses occur.
+    """
+    # _content_hash is used by lru_cache as part of the cache key for uniqueness
+    # We only use encoding_name and text for the actual computation
+    encoding = _get_encoding(encoding_name)
+    return len(encoding.encode(text))
+
+
 class TokenCounter:
     """
     Manages token counting with caching and multiple encoding support.
@@ -71,7 +96,7 @@ class TokenCounter:
 
     def count_tokens(self, text: str) -> int:
         """
-        Count tokens in text with caching.
+        Count tokens in text with LRU caching to prevent unbounded memory growth.
 
         Args:
             text: The text to count tokens for
@@ -82,18 +107,9 @@ class TokenCounter:
         if not text:
             return 0
 
-        # Check cache first
+        # Use the LRU cached function for token counting
         content_hash = self.compute_content_hash(text)
-        if content_hash in _token_cache:
-            return _token_cache[content_hash]
-
-        # Count tokens using tiktoken
-        tokens = len(self._encoding.encode(text))
-
-        # Cache the result
-        _token_cache[content_hash] = tokens
-
-        return tokens
+        return _count_tokens_cached(content_hash, self.encoding_name, text)
 
     def count_messages_tokens(self, messages: list[dict[str, Any]]) -> int:
         """
@@ -138,14 +154,17 @@ class TokenCounter:
 
     def get_cache_stats(self) -> dict[str, int]:
         """Get statistics about the token cache."""
+        cache_info = _count_tokens_cached.cache_info()
         return {
-            "cache_size": len(_token_cache),
-            "total_cached_tokens": sum(_token_cache.values()),
+            "cache_size": cache_info.currsize,
+            "cache_hits": cache_info.hits,
+            "cache_misses": cache_info.misses,
+            "max_cache_size": cache_info.maxsize or 0,
         }
 
     def clear_cache(self) -> None:
         """Clear the token cache."""
-        _token_cache.clear()
+        _count_tokens_cached.cache_clear()
 
 
 # Global default counter instance
