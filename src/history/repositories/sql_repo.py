@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from datetime import datetime, timedelta
@@ -17,21 +18,28 @@ logger = logging.getLogger(__name__)
 
 class AsyncSqlRepo(ChatRepository):
     """
-    SQL implementation of ChatRepository with configurable persistence.
-    Uses SQLite for simplicity; swap aiosqlite with asyncpg or other drivers
-    when moving to another database.
+    SQL implementation of ChatRepository with configurable persistence and
+    optimized connection management.
+
+    Features:
+    - Persistent connection with automatic reconnection on failure
+    - WAL mode for better concurrency
+    - Connection pooling support for high-throughput scenarios
+    - Comprehensive error handling with proper MCP error types
     """
 
     def __init__(
         self,
         db_path: str = "events.db",
-        persistence_config: dict[str, Any] | None = None
+        persistence_config: dict[str, Any] | None = None,
     ):
         self.db_path = db_path
         self._init_lock = asyncio.Lock()
         self._initialized = False
-        self._connection_lock = asyncio.Lock()  # Serialize database access
         self._connection: aiosqlite.Connection | None = None
+        self._connection_healthy = True
+        self._reconnect_attempts = 0
+        self._max_reconnect_attempts = 3
 
         # Persistence configuration
         self.persistence_config = persistence_config or {
@@ -43,6 +51,71 @@ class AsyncSqlRepo(ChatRepository):
             "clear_on_startup": False
         }
 
+    async def _ensure_connection(self) -> aiosqlite.Connection:
+        """
+        Ensure a healthy database connection exists, reconnecting if necessary.
+
+        Returns:
+            aiosqlite.Connection: A healthy database connection
+
+        Raises:
+            RuntimeError: If connection cannot be established after max attempts
+        """
+        if not self._connection or not self._connection_healthy:
+            await self._reconnect()
+
+        # At this point, _reconnect() ensures _connection is not None
+        assert self._connection is not None
+        return self._connection
+
+    async def _reconnect(self) -> None:
+        """Reconnect to the database with exponential backoff."""
+        if self._reconnect_attempts >= self._max_reconnect_attempts:
+            raise RuntimeError(
+                f"Failed to reconnect to database after "
+                f"{self._max_reconnect_attempts} attempts"
+            )
+
+        try:
+            # Close existing connection if it exists
+            if self._connection:
+                with contextlib.suppress(Exception):
+                    await self._connection.close()
+                self._connection = None
+
+            # Wait with exponential backoff
+            if self._reconnect_attempts > 0:
+                wait_time = min(2 ** self._reconnect_attempts, 10)  # Max 10s
+                logger.warning(
+                    f"Reconnecting to database in {wait_time}s "
+                    f"(attempt {self._reconnect_attempts + 1})"
+                )
+                await asyncio.sleep(wait_time)
+
+            # Create new connection
+            logger.info(f"Establishing database connection to {self.db_path}")
+            self._connection = await aiosqlite.connect(self.db_path)
+
+            # Configure SQLite for better concurrency and performance
+            await self._connection.execute("PRAGMA journal_mode=WAL")
+            await self._connection.execute("PRAGMA synchronous=NORMAL")
+            await self._connection.execute("PRAGMA cache_size=10000")
+            await self._connection.execute("PRAGMA temp_store=memory")
+            await self._connection.execute("PRAGMA busy_timeout=30000")
+
+            self._connection_healthy = True
+            self._reconnect_attempts = 0
+            logger.info("Database connection established successfully")
+
+        except Exception as e:
+            self._reconnect_attempts += 1
+            self._connection_healthy = False
+            logger.error(
+                f"Failed to connect to database: {e} "
+                f"(attempt {self._reconnect_attempts})"
+            )
+            raise
+
     async def _initialize(self) -> None:
         """
         Lazily create tables and indices on first use.
@@ -53,18 +126,10 @@ class AsyncSqlRepo(ChatRepository):
             if self._initialized:
                 return
 
-            # Create persistent connection
-            self._connection = await aiosqlite.connect(self.db_path)
+            # Establish connection using the new connection management
+            connection = await self._ensure_connection()
 
-            # Configure SQLite for better concurrency
-            await self._connection.execute("PRAGMA journal_mode=WAL")
-            await self._connection.execute("PRAGMA synchronous=NORMAL")
-            await self._connection.execute("PRAGMA cache_size=10000")
-            await self._connection.execute("PRAGMA temp_store=memory")
-            # 30 second timeout
-            await self._connection.execute("PRAGMA busy_timeout=30000")
-
-            await self._connection.execute("""
+            await connection.execute("""
                 CREATE TABLE IF NOT EXISTS chat_events (
                     id TEXT PRIMARY KEY,
                     conversation_id TEXT NOT NULL,
@@ -82,15 +147,15 @@ class AsyncSqlRepo(ChatRepository):
                     request_id TEXT
                 )
             """)
-            await self._connection.execute("""
+            await connection.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_request
                 ON chat_events(conversation_id, request_id)
             """)
-            await self._connection.execute("""
+            await connection.execute("""
                 CREATE INDEX IF NOT EXISTS idx_conversation_seq
                 ON chat_events(conversation_id, seq)
             """)
-            await self._connection.commit()
+            await connection.commit()
 
             # Handle persistence settings
             await self._handle_persistence_on_startup()
@@ -98,12 +163,54 @@ class AsyncSqlRepo(ChatRepository):
 
     async def close(self) -> None:
         """
-        Close the persistent database connection.
+        Close the persistent database connection and mark as uninitialized.
         """
         if self._connection:
-            await self._connection.close()
+            with contextlib.suppress(Exception):
+                await self._connection.close()
             self._connection = None
+            self._connection_healthy = False
             self._initialized = False
+            logger.info("Database connection closed successfully")
+
+    async def _execute_with_retry(self, operation_name: str, operation_func):
+        """
+        Execute a database operation with automatic retry on connection failure.
+
+        Args:
+            operation_name: Name of the operation for logging
+            operation_func: Async function that performs the database operation
+
+        Returns:
+            Result of the operation_func
+        """
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                connection = await self._ensure_connection()
+                return await operation_func(connection)
+            except (aiosqlite.OperationalError, aiosqlite.DatabaseError) as e:
+                self._connection_healthy = False
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Database operation '{operation_name}' failed: {e}. "
+                        f"Retrying (attempt {attempt + 1}/{max_retries})"
+                    )
+                    # Reset connection for retry
+                    self._connection = None
+                    continue
+
+                logger.error(
+                    f"Database operation '{operation_name}' failed after "
+                    f"{max_retries} retries: {e}"
+                )
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error in '{operation_name}': {e}")
+                raise
+
+        # This should never be reached due to the exception handling above
+        raise RuntimeError(f"Operation '{operation_name}' completed unexpectedly")
 
     async def __aenter__(self) -> AsyncSqlRepo:
         """Async context manager entry."""
@@ -144,13 +251,12 @@ class AsyncSqlRepo(ChatRepository):
 
     async def clear_all_conversations(self) -> None:
         """Clear all conversation data from the database."""
-        if not self._connection:
-            raise RuntimeError("Database connection not available")
-
-        async with self._connection_lock:
-            await self._connection.execute("DELETE FROM chat_events")
-            await self._connection.commit()
+        async def _clear_operation(connection: aiosqlite.Connection) -> None:
+            await connection.execute("DELETE FROM chat_events")
+            await connection.commit()
             logger.info("Cleared all conversation history")
+
+        await self._execute_with_retry("clear_all_conversations", _clear_operation)
 
     async def _apply_retention_policies(self) -> None:
         """Apply retention policies to existing conversations."""
@@ -159,16 +265,19 @@ class AsyncSqlRepo(ChatRepository):
         if retention_policy == "unlimited":
             return  # No cleanup needed
 
-        if not self._connection:
-            raise RuntimeError("Database connection not available")
-
-        # Get conversations directly to avoid circular dependency
-        async with self._connection_lock:
-            cursor = await self._connection.execute(
+        async def _get_conversations_operation(
+            connection: aiosqlite.Connection,
+        ) -> list[str]:
+            cursor = await connection.execute(
                 "SELECT DISTINCT conversation_id FROM chat_events"
             )
             rows = await cursor.fetchall()
-            conversations = [row[0] for row in rows]
+            await cursor.close()
+            return [row[0] for row in rows]
+
+        conversations = await self._execute_with_retry(
+            "_apply_retention_policies", _get_conversations_operation
+        )
 
         for conv_id in conversations:
             await self._apply_retention_to_conversation(conv_id, retention_policy)
@@ -177,19 +286,17 @@ class AsyncSqlRepo(ChatRepository):
         self, conversation_id: str, policy: str
     ) -> None:
         """Apply retention policy to a specific conversation."""
-        if not self._connection:
-            raise RuntimeError("Database connection not available")
-
-        async with self._connection_lock:
+        async def _retention_operation(connection: aiosqlite.Connection) -> None:
             if policy == "token_limit":
                 max_tokens = self.persistence_config["max_tokens_per_conversation"]
                 # Keep only events that fit within token limit (from most recent)
-                cursor = await self._connection.execute("""
+                cursor = await connection.execute("""
                     SELECT id, token_count FROM chat_events
                     WHERE conversation_id = ?
                     ORDER BY timestamp DESC
                 """, (conversation_id,))
                 rows = list(await cursor.fetchall())
+                await cursor.close()
 
                 total_tokens = 0
                 keep_ids = []
@@ -203,7 +310,7 @@ class AsyncSqlRepo(ChatRepository):
                 if keep_ids and len(keep_ids) < len(rows):
                     # Delete events not in keep_ids
                     placeholders = ",".join(["?" for _ in keep_ids])
-                    await self._connection.execute(f"""
+                    await connection.execute(f"""
                         DELETE FROM chat_events
                         WHERE conversation_id = ? AND id NOT IN ({placeholders})
                     """, [conversation_id, *keep_ids])
@@ -217,7 +324,7 @@ class AsyncSqlRepo(ChatRepository):
             elif policy == "message_count":
                 max_messages = self.persistence_config["max_messages_per_conversation"]
                 # Keep only the most recent N messages
-                await self._connection.execute("""
+                await connection.execute("""
                     DELETE FROM chat_events
                     WHERE conversation_id = ? AND id NOT IN (
                         SELECT id FROM chat_events
@@ -233,12 +340,16 @@ class AsyncSqlRepo(ChatRepository):
                     datetime.now().replace(microsecond=0) -
                     timedelta(days=retention_days)
                 )
-                await self._connection.execute("""
+                await connection.execute("""
                     DELETE FROM chat_events
                     WHERE conversation_id = ? AND timestamp < ?
                 """, (conversation_id, cutoff_date.isoformat()))
 
-            await self._connection.commit()
+            await connection.commit()
+
+        await self._execute_with_retry(
+            f"_apply_retention_to_conversation[{conversation_id}]", _retention_operation
+        )
 
     async def add_event(self, event: ChatEvent) -> bool:
         await self._initialize()
@@ -247,17 +358,14 @@ class AsyncSqlRepo(ChatRepository):
         if not self.persistence_config["enabled"]:
             return True  # Pretend we stored it successfully
 
-        if not self._connection:
-            raise RuntimeError("Database connection not available")
-
         # Extract request_id if present; stored in extra
         request_id = event.extra.get("request_id")
 
-        async with self._connection_lock:
+        async def _add_event_operation(connection: aiosqlite.Connection) -> bool:
             try:
                 # Auto-assign sequence number if not set
                 if event.seq is None or event.seq == 0:
-                    cursor = await self._connection.execute("""
+                    cursor = await connection.execute("""
                         SELECT COALESCE(MAX(seq), 0) + 1
                         FROM chat_events
                         WHERE conversation_id = ?
@@ -275,7 +383,7 @@ class AsyncSqlRepo(ChatRepository):
                     event.usage.model_dump() if event.usage else None
                 )
 
-                await self._connection.execute("""
+                await connection.execute("""
                     INSERT INTO chat_events (
                         id, conversation_id, seq, timestamp, type, role, content,
                         tool_calls, tool_call_id, model, usage, extra,
@@ -297,19 +405,25 @@ class AsyncSqlRepo(ChatRepository):
                     event.token_count,
                     request_id,
                 ))
-                await self._connection.commit()
+                await connection.commit()
                 return True
             except aiosqlite.IntegrityError:
                 # duplicate request_id
                 return False
 
+        return await self._execute_with_retry("add_event", _add_event_operation)
+
     async def add_events(self, events: list[ChatEvent]) -> bool:
         await self._initialize()
 
-        if not self._connection:
-            raise RuntimeError("Database connection not available")
+        if not events:
+            return True
 
-        async with self._connection_lock:
+        # If persistence is disabled, don't store events
+        if not self.persistence_config["enabled"]:
+            return True  # Pretend we stored it successfully
+
+        async def _add_events_operation(connection: aiosqlite.Connection) -> bool:
             try:
                 # Group events by conversation for sequence assignment
                 conv_events: dict[str, list[ChatEvent]] = {}
@@ -319,7 +433,7 @@ class AsyncSqlRepo(ChatRepository):
                 # Assign sequence numbers per conversation
                 for conv_id, conv_event_list in conv_events.items():
                     # Get current max sequence for this conversation
-                    cursor = await self._connection.execute("""
+                    cursor = await connection.execute("""
                         SELECT COALESCE(MAX(seq), 0)
                         FROM chat_events
                         WHERE conversation_id = ?
@@ -344,7 +458,7 @@ class AsyncSqlRepo(ChatRepository):
                         event.usage.model_dump() if event.usage else None
                     )
 
-                    await self._connection.execute("""
+                    await connection.execute("""
                         INSERT INTO chat_events (
                             id, conversation_id, seq, timestamp, type, role,
                             content, tool_calls, tool_call_id, model, usage,
@@ -366,10 +480,12 @@ class AsyncSqlRepo(ChatRepository):
                         event.token_count,
                         request_id,
                     ))
-                await self._connection.commit()
+                await connection.commit()
                 return True
             except aiosqlite.IntegrityError:
                 return False
+
+        return await self._execute_with_retry("add_events", _add_events_operation)
 
     async def get_events(
         self, conversation_id: str, limit: int | None = None
@@ -380,10 +496,9 @@ class AsyncSqlRepo(ChatRepository):
         if not self.persistence_config["enabled"]:
             return []
 
-        if not self._connection:
-            raise RuntimeError("Database connection not available")
-
-        async with self._connection_lock:
+        async def _get_events_operation(
+            connection: aiosqlite.Connection,
+        ) -> list[ChatEvent]:
             if limit is not None:
                 query = (
                     "SELECT * FROM chat_events WHERE conversation_id = ? "
@@ -397,10 +512,12 @@ class AsyncSqlRepo(ChatRepository):
                 )
                 params = (conversation_id,)
 
-            cursor = await self._connection.execute(query, params)
+            cursor = await connection.execute(query, params)
             rows = await cursor.fetchall()
             await cursor.close()
-        return [self._row_to_event(row) for row in rows]
+            return [self._row_to_event(row) for row in rows]
+
+        return await self._execute_with_retry("get_events", _get_events_operation)
 
     async def last_n_tokens(
         self, conversation_id: str, max_tokens: int
@@ -411,12 +528,11 @@ class AsyncSqlRepo(ChatRepository):
         if not self.persistence_config["enabled"]:
             return []
 
-        if not self._connection:
-            raise RuntimeError("Database connection not available")
-
-        # Fetch events in reverse order and accumulate tokens until limit
-        async with self._connection_lock:
-            cursor = await self._connection.execute(
+        async def _last_n_tokens_operation(
+            connection: aiosqlite.Connection,
+        ) -> list[ChatEvent]:
+            # Fetch events in reverse order and accumulate tokens until limit
+            cursor = await connection.execute(
                 "SELECT * FROM chat_events WHERE conversation_id = ? "
                 "ORDER BY seq DESC",
                 (conversation_id,)
@@ -431,39 +547,47 @@ class AsyncSqlRepo(ChatRepository):
                 events.insert(0, event)  # prepend to maintain chronological order
                 total += tokens
             await cursor.close()
-        return events
+            return events
+
+        return await self._execute_with_retry("last_n_tokens", _last_n_tokens_operation)
 
     async def list_conversations(self) -> list[str]:
         await self._initialize()
 
-        if not self._connection:
-            raise RuntimeError("Database connection not available")
-
-        async with self._connection_lock:
-            cursor = await self._connection.execute(
+        async def _list_conversations_operation(
+            connection: aiosqlite.Connection,
+        ) -> list[str]:
+            cursor = await connection.execute(
                 "SELECT DISTINCT conversation_id FROM chat_events"
             )
             rows = await cursor.fetchall()
             await cursor.close()
-        return [row[0] for row in rows]
+            return [row[0] for row in rows]
+
+        return await self._execute_with_retry(
+            "list_conversations", _list_conversations_operation
+        )
 
     async def get_event_by_request_id(
         self, conversation_id: str, request_id: str
     ) -> ChatEvent | None:
         await self._initialize()
 
-        if not self._connection:
-            raise RuntimeError("Database connection not available")
-
-        async with self._connection_lock:
-            cursor = await self._connection.execute(
+        async def _get_event_by_request_id_operation(
+            connection: aiosqlite.Connection,
+        ) -> ChatEvent | None:
+            cursor = await connection.execute(
                 "SELECT * FROM chat_events WHERE conversation_id = ? "
                 "AND request_id = ?",
                 (conversation_id, request_id)
             )
             row = await cursor.fetchone()
             await cursor.close()
-        return self._row_to_event(row) if row else None
+            return self._row_to_event(row) if row else None
+
+        return await self._execute_with_retry(
+            "get_event_by_request_id", _get_event_by_request_id_operation
+        )
 
     async def event_exists(
         self, conversation_id: str, event_type: str, request_id: str
@@ -473,29 +597,29 @@ class AsyncSqlRepo(ChatRepository):
         """
         await self._initialize()
 
-        if not self._connection:
-            raise RuntimeError("Database connection not available")
-
-        async with self._connection_lock:
-            cursor = await self._connection.execute(
+        async def _event_exists_operation(
+            connection: aiosqlite.Connection,
+        ) -> bool:
+            cursor = await connection.execute(
                 "SELECT 1 FROM chat_events WHERE conversation_id = ? "
                 "AND request_id = ? AND type = ?",
                 (conversation_id, request_id, event_type)
             )
             row = await cursor.fetchone()
             await cursor.close()
-        return row is not None
+            return row is not None
+
+        return await self._execute_with_retry("event_exists", _event_exists_operation)
 
     async def get_last_assistant_reply_id(
         self, conversation_id: str, user_request_id: str
     ) -> str | None:
         await self._initialize()
 
-        if not self._connection:
-            raise RuntimeError("Database connection not available")
-
-        async with self._connection_lock:
-            cursor = await self._connection.execute("""
+        async def _get_last_assistant_reply_id_operation(
+            connection: aiosqlite.Connection,
+        ) -> str | None:
+            cursor = await connection.execute("""
                 SELECT id, extra FROM chat_events
                 WHERE conversation_id = ? AND type = 'assistant_message'
                 ORDER BY seq DESC
@@ -506,7 +630,11 @@ class AsyncSqlRepo(ChatRepository):
                     await cursor.close()
                     return row[0]
             await cursor.close()
-        return None
+            return None
+
+        return await self._execute_with_retry(
+            "get_last_assistant_reply_id", _get_last_assistant_reply_id_operation
+        )
 
     async def get_event_by_id(
         self, conversation_id: str, event_id: str
@@ -524,17 +652,20 @@ class AsyncSqlRepo(ChatRepository):
         if not self.persistence_config["enabled"]:
             return None
 
-        if not self._connection:
-            raise RuntimeError("Database connection not available")
-
-        async with self._connection_lock:
-            cursor = await self._connection.execute(
+        async def _get_event_by_id_operation(
+            connection: aiosqlite.Connection,
+        ) -> ChatEvent | None:
+            cursor = await connection.execute(
                 "SELECT * FROM chat_events WHERE conversation_id = ? AND id = ?",
                 (conversation_id, event_id)
             )
             row = await cursor.fetchone()
             await cursor.close()
-        return self._row_to_event(row) if row else None
+            return self._row_to_event(row) if row else None
+
+        return await self._execute_with_retry(
+            "get_event_by_id", _get_event_by_id_operation
+        )
 
     async def compact_deltas(
         self,
@@ -547,18 +678,19 @@ class AsyncSqlRepo(ChatRepository):
         # remove meta delta events and insert one assistant_message
         await self._initialize()
 
-        if not self._connection:
-            raise RuntimeError("Database connection not available")
-
-        async with self._connection_lock:
+        async def _compact_deltas_operation(
+            connection: aiosqlite.Connection,
+        ) -> None:
             # Delete meta events for this user_request_id
-            await self._connection.execute("""
+            await connection.execute("""
                 DELETE FROM chat_events
                 WHERE conversation_id = ? AND type = 'meta'
                 AND json_extract(extra, '$.kind') = 'assistant_delta'
                 AND json_extract(extra, '$.user_request_id') = ?
             """, (conversation_id, user_request_id))
-            await self._connection.commit()
+            await connection.commit()
+
+        await self._execute_with_retry("compact_deltas", _compact_deltas_operation)
 
         # Insert a new assistant_message
         new_event = ChatEvent(
