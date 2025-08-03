@@ -25,7 +25,12 @@ class Configuration:
         """Load configuration from YAML file."""
         config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
         with open(config_path) as file:
-            return yaml.safe_load(file)
+            config = yaml.safe_load(file)
+            if not isinstance(config, dict):
+                raise ValueError(
+                    f"Config file must be YAML dict, got {type(config)}"
+                )
+            return config
 
     @staticmethod
     def load_config(file_path: str) -> dict[str, Any]:
@@ -425,3 +430,39 @@ class Configuration:
                 )
 
         return chat_store_config
+
+    def get_repository_config(self) -> dict[str, Any]:
+        """Get repository configuration from YAML.
+
+        Returns:
+            Repository configuration dictionary with persistence settings.
+
+        Raises:
+            ValueError: If required repository parameters are missing.
+        """
+        chat_config = self._config.get("chat", {})
+        service_config = chat_config.get("service", {})
+        repo_config = service_config.get("repository", {})
+
+        # Set defaults for backward compatibility
+        if "persistence" not in repo_config:
+            repo_config["persistence"] = {
+                "enabled": True,
+                "retention_policy": "token_limit",
+                "max_tokens_per_conversation": 8000,
+                "max_messages_per_conversation": 100,
+                "retention_days": 30,
+                "clear_on_startup": False
+            }
+
+        # Validate persistence configuration
+        persistence_config = repo_config["persistence"]
+        valid_policies = ["token_limit", "message_count", "time_based", "unlimited"]
+
+        if persistence_config["retention_policy"] not in valid_policies:
+            raise ValueError(
+                "repository.persistence.retention_policy must be one of: "
+                f"{valid_policies}"
+            )
+
+        return repo_config

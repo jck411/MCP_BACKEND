@@ -24,10 +24,27 @@ chat:
       You are a helpful assistant with a sense of humor.
       You have access to to a list of tools, use them when needed and explain why you used them.
 
-    # Repository configuration
+    # Repository configuration (SQLite database)
     repository:
-      type: "jsonl"  # Options: "jsonl", "async_jsonl", "memory"
-      path: "events.jsonl"  # File path for file-based repositories
+      type: "sql"              # SQLite database storage
+      path: "events.db"        # Database file path
+      
+      # Persistent memory configuration
+      persistence:
+        enabled: true           # Enable persistent memory storage
+        retention_policy: "token_limit"  # "token_limit" | "message_count" | "time_based" | "unlimited"
+        
+        # Token-based retention (when retention_policy: "token_limit")
+        max_tokens_per_conversation: 8000  # Maximum tokens to retain per conversation
+        
+        # Message-based retention (when retention_policy: "message_count") 
+        max_messages_per_conversation: 100  # Maximum messages to retain per conversation
+        
+        # Time-based retention (when retention_policy: "time_based")
+        retention_days: 30      # Days to retain conversation history
+        
+        # Startup behavior - controls session persistence
+        clear_on_startup: true  # Clear all conversations on startup (session-only memory)
 
     # Context management configuration
     context:

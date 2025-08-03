@@ -24,7 +24,7 @@ from pydantic import AnyUrl
 import src.chat_service
 from src.chat_service import ChatService
 from src.config import Configuration
-from src.history.chat_store import AsyncJsonlRepo
+from src.history.repositories.sql_repo import AsyncSqlRepo
 from src.websocket_server import ServerConfig, run_websocket_server
 
 logging.basicConfig(
@@ -294,6 +294,10 @@ class MCPClient:
         )
 
         # Complete MCP initialization handshake with configurable timeout
+        if self.session is None:
+            raise RuntimeError(
+                f"MCP client '{self.name}' session is None during initialization"
+            )
         await asyncio.wait_for(
             self.session.initialize(), timeout=self._connection_timeout
         )
@@ -723,14 +727,15 @@ class LLMClient:
         await self.close()
 
 
-def create_repository() -> AsyncJsonlRepo:
+def create_repository(config: Configuration) -> AsyncSqlRepo:
     """Create repository instance based on configuration."""
-    # Use default configuration for repository
-    events_file = "events.jsonl"
-    fsync_enabled = True
+    repo_config = config.get_repository_config()
+    db_path = repo_config.get("path", "events.db")
+    persistence_config = repo_config.get("persistence", {})
 
-    logging.info(f"Using AsyncJsonlRepo with path: {events_file}")
-    return AsyncJsonlRepo(events_file, fsync_enabled=fsync_enabled)
+    logging.info(f"Using AsyncSqlRepo with database path: {db_path}")
+    logging.info(f"Persistence enabled: {persistence_config.get('enabled', True)}")
+    return AsyncSqlRepo(db_path, persistence_config)
 
 
 def setup_mcp_clients(config: Configuration) -> list[MCPClient]:
@@ -789,7 +794,7 @@ async def main() -> None:
     api_key = config.llm_api_key
 
     # Create repository for chat history based on configuration
-    repo = create_repository()
+    repo = create_repository(config)
 
     # Now that MCPClient and LLMClient are defined, make them available
     # in the chat_service module's namespace and rebuild ChatServiceConfig

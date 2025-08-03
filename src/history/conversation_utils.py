@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from src.history.chat_store import ChatEvent
+from src.history.models import ChatEvent
 from src.history.token_counter import count_conversation_tokens, estimate_tokens
 
 logger = logging.getLogger(__name__)

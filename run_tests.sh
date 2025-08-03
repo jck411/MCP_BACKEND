@@ -17,7 +17,7 @@ else
 fi
 
 # Run the test
-$PYTHON_CMD test_system.py
+$PYTHON_CMD test_sql_refactor.py
 
 # Check exit code
 if [ $? -eq 0 ]; then

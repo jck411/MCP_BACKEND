@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from src.chat_service import ChatMessage, ChatService
 from src.config import Configuration
-from src.history.chat_store import ChatRepository
+from src.history.repositories.base import ChatRepository
 
 # TYPE_CHECKING imports to avoid circular imports
 if TYPE_CHECKING:

@@ -27,6 +27,7 @@ dependencies = [
     "aiofiles>=24.1.0", # For async file I/O operations
     "filelock>=3.18.0",
     "structlog>=25.4.0",
+    "aiosqlite>=0.20.0", # For async SQLite operations
 ]
 
 [project.scripts]
