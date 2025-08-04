@@ -28,6 +28,7 @@ dependencies = [
     "filelock>=3.18.0",
     "structlog>=25.4.0",
     "aiosqlite>=0.20.0", # For async SQLite operations
+    "tenacity>=9.1.2",
 ]
 
 [project.scripts]
@@ -93,6 +94,7 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "pytest-asyncio>=1.1.0",
+    "ruff>=0.12.5",
 ]
 
 [tool.hatch.build.targets.wheel]
