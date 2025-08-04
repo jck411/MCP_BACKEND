@@ -553,11 +553,35 @@ class LLMClient:
 
         self.config: dict[str, Any] = config
         self.api_key: str = api_key
+
+        # Get provider-specific headers for optimal API performance
+        headers = self._get_provider_headers(api_key, config["base_url"])
+
         self.client: httpx.AsyncClient = httpx.AsyncClient(
             base_url=config["base_url"],
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=headers,
             timeout=30.0,
         )
+
+    def _get_provider_headers(self, api_key: str, base_url: str) -> dict[str, str]:
+        """Get provider-specific headers for optimal API performance."""
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "MCP-Platform/2025"
+        }
+
+        if "openrouter.ai" in base_url:
+            # OpenRouter-specific headers for better service ranking
+            headers.update({
+                "HTTP-Referer": "https://localhost:8000",
+                "X-Title": "MCP Platform",
+            })
+        elif "api.openai.com" in base_url:
+            # OpenAI-specific optimizations
+            headers["OpenAI-Beta"] = "assistants=v2"
+
+        return headers
 
     async def get_response_with_tools(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
