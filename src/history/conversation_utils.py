@@ -70,19 +70,27 @@ def build_conversation_with_token_limit(
     accumulated_tokens = system_tokens + 3  # system message + overhead
 
     # Process events in chronological order to maintain conversation flow
+    user_message_already_included = False
     for event in events:
         # Only include events that make sense in LLM conversation context
         if event.type in ("user_message", "assistant_message", "system_update"):
+            # Check if this is a user message with exact same content as current
+            if (event.type == "user_message" and
+                event.role == "user" and
+                event.content == user_message):
+                user_message_already_included = True
+
             # Get cached token count for this event
             event_tokens = event.compute_and_cache_tokens()
             event_overhead = 3  # message formatting overhead
             total_event_cost = event_tokens + event_overhead
 
             # Check if adding this event would exceed our budget
-            # Account for user message that will be added at the end
+            # Account for user message that will be added (if not already included)
+            user_msg_cost = 0 if user_message_already_included else (user_tokens + 3)
             projected_total = (
-                accumulated_tokens + total_event_cost + user_tokens + 3 + 3
-            )  # user msg + overhead + priming
+                accumulated_tokens + total_event_cost + user_msg_cost + 3
+            )  # overhead + priming
 
             if projected_total + reserve_tokens > max_tokens:
                 logger.debug(
@@ -96,11 +104,16 @@ def build_conversation_with_token_limit(
             conversation.append(event_msg)
             accumulated_tokens += total_event_cost
 
-    # Always append the current user message last (required for OpenAI format)
-    conversation.append({"role": "user", "content": user_message})
-    final_tokens = (
-        accumulated_tokens + user_tokens + 3 + 3
-    )  # user msg + overhead + priming
+    # Append the current user message only if it wasn't already included from events
+    if not user_message_already_included:
+        conversation.append({"role": "user", "content": user_message})
+        final_tokens = (
+            accumulated_tokens + user_tokens + 3 + 3
+        )  # user msg + overhead + priming
+    else:
+        final_tokens = (
+            accumulated_tokens + 3
+        )  # just priming tokens
 
     return conversation, final_tokens
 

@@ -214,11 +214,11 @@ class WebSocketServer:
         logger.info(f"Received chat message: {user_message[:50]}...")
 
         try:
-            # Send processing status
+            # Send processing status (without echoing user message back)
             response = WebSocketResponse(
                 request_id=request_id,
                 status="processing",
-                chunk={"metadata": {"user_message": user_message}}
+                chunk={"metadata": {"processing": True}}
             )
             await websocket.send_text(response.model_dump_json())
 

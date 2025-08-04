@@ -602,8 +602,8 @@ class AsyncSqlRepo(ChatRepository):
         ) -> bool:
             cursor = await connection.execute(
                 "SELECT 1 FROM chat_events WHERE conversation_id = ? "
-                "AND request_id = ? AND type = ?",
-                (conversation_id, request_id, event_type)
+                "AND type = ? AND request_id = ?",
+                (conversation_id, event_type, request_id)
             )
             row = await cursor.fetchone()
             await cursor.close()
