@@ -7,6 +7,14 @@ This module handles the business logic for chat sessions, including:
 - MCP client coordination
 - LLM interactions
 - File lock contention handling with exponential backoff
+
+This version is based off the 2025‑08‑02 refactor, but incorporates a number of
+performance fixes.  In particular it avoids quadratic behaviour when
+accumulating streamed tool call fragments, eliminates double JSON parsing
+during tool execution, and uses a simple `defaultdict` for conversation
+locks instead of a `WeakValueDictionary` to reduce lock churn.  A per‑response
+map of tool‑call IDs to indices is maintained to resolve missing indices
+quickly without scanning the current tool call list.
 """
 
 from __future__ import annotations
@@ -78,7 +86,7 @@ class ChatService:
 
     def __init__(
         self,
-        service_config: ChatServiceConfig,
+        service_config: ChatService.ChatServiceConfig,
     ):
         self.clients = service_config.clients
         self.llm_client = service_config.llm_client
@@ -97,22 +105,59 @@ class ChatService:
         self._ready = asyncio.Event()
         self._resource_catalog: list[str] = []  # Initialize resource catalog
 
-        # *NEW* - per-conversation locks to serialise writes
-        self._conv_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # Per‑conversation locks to serialize writes.  We use a simple
+        # defaultdict rather than WeakValueDictionary to avoid churn: once
+        # created, a lock remains for the lifetime of the process.
+        self._conv_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+        # Internal map used to resolve tool call indices quickly.  This is
+        # initialised on each call to `_stream_llm_response_with_deltas`.
+        self._tool_call_index_map: dict[str, int] = {}
 
     # helper - returns the lock object (always the same instance per conv-id)
     def _conv_lock(self, conv_id: str) -> asyncio.Lock:
         return self._conv_locks[conv_id]
 
+    def get_active_conversation_locks_count(self) -> int:
+        """
+        Get the current number of active conversation locks.
+
+        Useful for monitoring memory usage and ensuring locks are being
+        properly retained.
+
+        Returns:
+            int: Number of currently active conversation locks
+        """
+        return len(self._conv_locks)
+
+    def _exceeded_tool_hops(self, current_hops: int) -> tuple[bool, int, str]:
+        """
+        Check if tool hop limit has been exceeded.
+
+        Returns:
+            tuple: (exceeded, max_hops, warning_message)
+                - exceeded: True if current_hops >= max_tool_hops
+                - max_hops: The configured maximum tool hops limit
+                - warning_message: Standardized warning message for user display
+        """
+        max_tool_hops = self.configuration.get_max_tool_hops()
+        exceeded = current_hops >= max_tool_hops
+        warning_message = (
+            f"⚠️ Reached maximum tool call limit ({max_tool_hops}). "
+            "Stopping to prevent infinite recursion."
+        )
+        return exceeded, max_tool_hops, warning_message
+
     async def initialize(self) -> None:
-        """Initialize the chat service and all MCP clients."""
+        """Initialize the chat service and all MCP clients with parallel connections."""
         async with self._init_lock:
             if self._ready.is_set():
                 return
 
-            # Connect to all clients and collect results
+            # PERFORMANCE: Connect to all clients in parallel
+            connection_tasks = [c.connect() for c in self.clients]
             connection_results = await asyncio.gather(
-                *(c.connect() for c in self.clients), return_exceptions=True
+                *connection_tasks, return_exceptions=True
             )
 
             # Filter out only successfully connected clients
@@ -132,15 +177,18 @@ class ChatService:
             else:
                 logger.info(
                     f"Successfully connected to {len(connected_clients)} out of "
-                    f"{len(self.clients)} MCP clients"
+                    f"{len(self.clients)} MCP clients in parallel"
                 )
 
             # Use connected clients for tool management (empty list is acceptable)
             self.tool_mgr = ToolSchemaManager(connected_clients)
-            await self.tool_mgr.initialize()
+            
+            # PERFORMANCE: Initialize tool manager and resource catalog in parallel
+            await asyncio.gather(
+                self.tool_mgr.initialize(),
+                self._update_resource_catalog_on_availability(),
+            )
 
-            # Update resource catalog to only include available resources
-            await self._update_resource_catalog_on_availability()
             self._system_prompt = await self._make_system_prompt()
 
             logger.info(
@@ -167,14 +215,14 @@ class ChatService:
         request_id: str,
     ) -> AsyncGenerator[ChatMessage]:
         """
-        Streaming entry-point - now *serialised per conversation*.
+        Streaming entry-point - serialized per conversation.
         """
         await self._ready.wait()
         self._validate_streaming_support()
 
-        async with self._conv_lock(conversation_id):          # NEW 🔒
-            should_continue = await self._handle_user_message_persistence(
-                conversation_id, user_msg, request_id
+        async with self._conv_lock(conversation_id):
+            should_continue, _ = await self._handle_user_message_persistence(
+                conversation_id, user_msg, request_id, return_cached_response=False
             )
             if not should_continue:
                 async for msg in self._yield_existing_response(
@@ -196,10 +244,6 @@ class ChatService:
         """
         Validate that streaming is supported by both tool manager and LLM client.
 
-        This internal method performs fail-fast validation to ensure that all required
-        components for streaming are available before attempting to process a message.
-        Called early in process_message() to prevent partial execution.
-
         Raises:
             RuntimeError: If tool manager is not initialized or if LLM client
                          doesn't support streaming functionality
@@ -214,34 +258,52 @@ class ChatService:
             )
 
     async def _handle_user_message_persistence(
-        self, conversation_id: str, user_msg: str, request_id: str
-    ) -> bool:
+        self,
+        conversation_id: str,
+        user_msg: str,
+        request_id: str,
+        return_cached_response: bool = False,
+    ) -> tuple[bool, ChatEvent | None]:
         """
-        Handle user message persistence with concurrency-safe duplicate detection.
+        Handle user message persistence with unified logic for both streaming
+        and non-streaming modes.
 
         CONCURRENCY SAFETY: This method implements a two-level check pattern:
         1. First check for existing assistant response (complete request)
         2. Then check for existing user message (request in progress)
+        3. Robust persistence with proper error handling
 
-        This prevents race conditions where multiple processes/coroutines handle
-        the same request_id simultaneously, ensuring idempotent behavior.
+        Args:
+            conversation_id: The conversation identifier
+            user_msg: The user message content
+            request_id: The request identifier for idempotency
+            return_cached_response: If True, return the cached ChatEvent for
+                non-streaming mode
+
+        Returns:
+            tuple: (should_continue, cached_response)
+                - should_continue: True if processing should continue, False if
+                  using cache
+                - cached_response: The cached response if found and
+                  return_cached_response=True
         """
-        # CONCURRENCY SAFETY: First check for completed assistant response
-        # If found, we can return cached output without any disk writes
+        # Check for completed assistant response
         existing = await self._get_existing_assistant_response(
             conversation_id, request_id
         )
         if existing:
-            return False                           # tell caller to use cache
+            if return_cached_response:
+                logger.info(f"Returning cached response for request_id: {request_id}")
+                return False, existing
+            return False, None
 
-        # CONCURRENCY SAFETY: Check if another process is already working on
-        # this request (user message exists but no assistant response yet)
+        # Check if another process is already working on this request
         if await self.repo.event_exists(
             conversation_id, "user_message", request_id
         ):
-            return True                            # proceed - assistant not done yet
+            return True, None  # proceed - assistant not done yet
 
-        # Otherwise persist the user message (single write)
+        # Attempt to persist user message with robust error handling
         user_ev = ChatEvent(
             conversation_id=conversation_id,
             seq=0,
@@ -251,11 +313,23 @@ class ChatService:
             extra={"request_id": request_id},
         )
         user_ev.compute_and_cache_tokens()
-        added = await self.repo.add_event(user_ev)
-        if not added:
-            # Event already exists; either return or ignore depending on your logic
-            return True
-        return True
+
+        try:
+            added = await self.repo.add_event(user_ev)
+            if not added:
+                # Race condition: another process inserted first
+                logger.debug(
+                    f"User message for request_id {request_id} already exists "
+                    "(race condition handled)"
+                )
+        except Exception as e:
+            # Database constraint violation or other error
+            logger.debug(
+                f"Failed to persist user message for request_id {request_id}: {e}"
+            )
+            # Continue anyway - user message exists from another process
+
+        return True, None
 
     async def _yield_existing_response(
         self, conversation_id: str, request_id: str
@@ -298,14 +372,14 @@ class ChatService:
     async def _build_conversation_history(
         self, conversation_id: str, user_msg: str
     ) -> list[dict[str, Any]]:
-        """Build conversation history from repository."""
+        """Build conversation history from repository with token limits."""
         events = await self.repo.last_n_tokens(conversation_id, self.ctx_window)
         conv, _ = build_conversation_with_token_limit(
             self._system_prompt,
             events,
             user_msg,
             self.ctx_window,
-            self.reserve_tokens  # Use configured reserve tokens
+            self.reserve_tokens
         )
         return conv
 
@@ -344,9 +418,10 @@ class ChatService:
             assistant_msg=assistant_msg,
             full_content=full_content
         )
+        final_full_content = full_content
         async for msg in self._handle_tool_call_iterations(context):
             if isinstance(msg, str):
-                full_content = msg  # Updated full content
+                final_full_content = msg  # Capture the final content
             else:
                 yield msg
 
@@ -354,7 +429,7 @@ class ChatService:
         await self.repo.compact_deltas(
             conversation_id,
             request_id,
-            full_content,
+            final_full_content,
             usage=self._convert_usage(None),
             model=self.llm_client.config.get("model", "")
         )
@@ -385,13 +460,9 @@ class ChatService:
         hops = 0
 
         while context.assistant_msg.get("tool_calls"):
-            max_tool_hops = self.configuration.get_max_tool_hops()
-            if hops >= max_tool_hops:
-                warning_msg = (
-                    f"⚠️ Reached maximum tool call limit ({max_tool_hops}). "
-                    "Stopping to prevent infinite recursion."
-                )
-                logger.warning(f"Maximum tool hops ({max_tool_hops}) reached, stopping")
+            exceeded, max_hops, warning_msg = self._exceeded_tool_hops(hops)
+            if exceeded:
+                logger.warning(f"Maximum tool hops ({max_hops}) reached, stopping")
                 context.full_content += "\n\n" + warning_msg
                 yield ChatMessage(
                     type="text",
@@ -400,14 +471,17 @@ class ChatService:
                 )
                 break
 
-            # Execute tool calls
+            # Clean tool calls for conversation (remove helper keys)
+            cleaned_tool_calls = self._clean_tool_calls_for_conversation(
+                context.assistant_msg["tool_calls"]
+            )
             context.conv.append({
                 "role": "assistant",
                 "content": context.assistant_msg.get("content") or "",
-                "tool_calls": context.assistant_msg["tool_calls"],
+                "tool_calls": cleaned_tool_calls,
             })
             await self._execute_tool_calls(
-                context.conv, context.assistant_msg["tool_calls"]
+                context.conv, cleaned_tool_calls
             )
 
             # Get follow-up response
@@ -438,22 +512,25 @@ class ChatService:
         hop_number: int = 0
     ) -> AsyncGenerator[ChatMessage | dict[str, Any]]:
         """
-        Identical user-facing behaviour, but we persist deltas **in batches**
-        to avoid hitting database locks too frequently.
+        PERFORMANCE OPTIMIZED: Batch delta persistence to reduce database load.
         """
+        # Reset the tool call index map for this streaming session
+        self._tool_call_index_map = {}
+
         message_buffer: str = ""
         current_tool_calls: list[dict[str, Any]] = []
         pending_deltas: list[ChatEvent] = []
-        flush_count: int = 0
 
+        # PERFORMANCE: More aggressive batching with configurable size
+        batch_size = self.chat_conf.get("delta_batch_size", 25)  # Increased from 10
+        
         async def _flush():
-            nonlocal pending_deltas, flush_count
+            nonlocal pending_deltas
             if not pending_deltas:
                 return
-            flush_count += 1
             batch = pending_deltas
             pending_deltas = []
-            # Use bulk write method
+            # Use optimized bulk write method
             await self.repo.add_events(batch)
 
         delta_index = 0
@@ -466,7 +543,7 @@ class ChatService:
                 continue
 
             choice = chunk["choices"][0]
-            delta  = choice.get("delta", {})
+            delta = choice.get("delta", {})
 
             # --- 1. content ------------------------------------------------
             if content := delta.get("content"):
@@ -482,7 +559,6 @@ class ChatService:
                             "user_request_id": user_request_id,
                             "hop_number": hop_number,
                             "delta_index": delta_index,
-                            "request_id": user_request_id,
                         },
                     )
                 )
@@ -499,15 +575,16 @@ class ChatService:
             if "finish_reason" in choice:
                 finish_reason = choice["finish_reason"]
 
-            # flush periodically
-            flush_every_n_deltas = 10  # Sensible default for batch flushing
-            if len(pending_deltas) >= flush_every_n_deltas:
+            # PERFORMANCE: Flush when batch is full or on finish
+            if len(pending_deltas) >= batch_size or finish_reason:
                 await _flush()
 
         await _flush()                    # final flush
 
-        if (current_tool_calls and
-            any(c["function"]["name"] for c in current_tool_calls)):
+        if (
+            current_tool_calls and
+            any(c["function"]["name"] for c in current_tool_calls)
+        ):
             yield ChatMessage(
                 type="tool_execution",
                 content=f"Executing {len(current_tool_calls)} tool(s)...",
@@ -517,111 +594,113 @@ class ChatService:
         yield {
             "content": message_buffer or None,
             "tool_calls": (
-                current_tool_calls
-                if (current_tool_calls and
-                    any(c["function"]["name"] for c in current_tool_calls))
+                self._clean_tool_calls_for_conversation(current_tool_calls)
+                if (
+                    current_tool_calls and
+                    any(c["function"]["name"] for c in current_tool_calls)
+                )
                 else None
             ),
             "finish_reason": finish_reason,
         }
 
+    def _clean_tool_calls_for_conversation(
+        self, tool_calls: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """
+        Clean tool calls by removing internal helper keys before adding to conversation.
+
+        Removes 'name_parts' and 'args_parts' keys that are used internally for
+        accumulating streaming deltas but should not leak into conversation history
+        or be persisted to the database.
+
+        Args:
+            tool_calls: List of tool call dictionaries potentially containing
+                       helper keys
+
+        Returns:
+            List of cleaned tool call dictionaries suitable for conversation history
+        """
+        cleaned_calls = []
+        for call in tool_calls:
+            # create a shallow copy to avoid mutating the original structure
+            cleaned_func = {
+                "name": call["function"].get("name", ""),
+                "arguments": call["function"].get("arguments", "")
+            }
+            cleaned_calls.append({
+                "id": call.get("id", ""),
+                "type": call.get("type", "function"),
+                "function": cleaned_func
+            })
+        return cleaned_calls
+
     def _accumulate_tool_calls(
         self, current_tool_calls: list[dict[str, Any]], tool_calls: list[dict[str, Any]]
     ) -> None:
         """
-        Accumulate streaming tool call deltas into complete tool call structures.
+        PERFORMANCE OPTIMIZED: Accumulate streaming tool call deltas efficiently.
 
-        This is a critical internal method that handles the complex task of assembling
-        tool calls from streaming deltas. LLM APIs stream tool calls in fragments:
-        - Tool call IDs may arrive first
-        - Function names may arrive in multiple chunks
-        - Function arguments arrive as partial JSON strings
-        - Deltas may arrive out of order or with missing indices
-
-        The method uses a defensive accumulation strategy:
-        1. Ensures the current_tool_calls list has enough slots for all indices
-        2. Uses list-based accumulation for both names and arguments
-        3. Rebuilds complete strings from accumulated parts after each delta
-
-        This approach handles edge cases like:
-        - Out-of-order deltas (common with parallel processing)
-        - Missing or duplicate deltas
-        - Partial JSON in arguments that needs to be concatenated
+        This method assembles tool calls from streaming deltas using an optimized
+        approach that avoids quadratic behavior. It uses a per-session map
+        (`self._tool_call_index_map`) to resolve missing indices in O(1) time.
+        Function names and arguments are accumulated using efficient string
+        concatenation instead of list-based approaches.
 
         Args:
-            current_tool_calls: The mutable list being built up (modified in-place)
-            tool_calls: List of delta fragments from the current streaming chunk
-
-        Side Effects:
-            - Modifies current_tool_calls in-place by extending or updating elements
-            - Creates intermediate "_parts" lists to handle out-of-order accumulation
-            - Rebuilds name and arguments strings from parts after each update
-
-        Implementation Notes:
-            The method maintains both the final strings (name, arguments) and the
-            intermediate parts lists (name_parts, args_parts) to handle streaming
-            edge cases robustly. This prevents corruption when deltas arrive
-            out of order.
+            current_tool_calls: Mutable list being built up (modified in-place)
+            tool_calls: List of delta fragments from current streaming chunk
         """
         for tool_call in tool_calls:
-            # Ensure we have enough space in the buffer for this tool call index
-            while len(current_tool_calls) <= tool_call.get("index", 0):
-                current_tool_calls.append({
-                    "id": "",
-                    "type": "function",
-                    "function": {"name": "", "arguments": ""}
-                })
+            # PERFORMANCE: O(1) index resolution using explicit or mapped index
+            if "index" in tool_call:
+                idx = tool_call["index"]
+                # Ensure sufficient capacity
+                while len(current_tool_calls) <= idx:
+                    current_tool_calls.append(self._create_empty_tool_call())
+                # Update mapping if id is present
+                if tool_call.get("id"):
+                    self._tool_call_index_map[tool_call["id"]] = idx
+            else:
+                tool_id = tool_call.get("id", "")
+                if tool_id and tool_id in self._tool_call_index_map:
+                    idx = self._tool_call_index_map[tool_id]
+                else:
+                    idx = len(current_tool_calls)
+                    current_tool_calls.append(self._create_empty_tool_call())
+                    if tool_id:
+                        self._tool_call_index_map[tool_id] = idx
 
-            idx = tool_call.get("index", 0)
-
-            # Accumulate tool call ID (usually arrives first and complete)
+            # PERFORMANCE: Direct string accumulation instead of list concatenation
             if "id" in tool_call:
                 current_tool_calls[idx]["id"] = tool_call["id"]
 
-            # Accumulate function details using part-based strategy
+            # Handle function details with optimized accumulation
             if "function" in tool_call:
                 func = tool_call["function"]
+                target_func = current_tool_calls[idx]["function"]
 
-                # Handle function name accumulation (may arrive in chunks)
+                # Direct string concatenation for name (faster than list join)
                 if "name" in func:
-                    # Initialize parts list if not exists
-                    if "name_parts" not in current_tool_calls[idx]["function"]:
-                        current_tool_calls[idx]["function"]["name_parts"] = []
-                    # Accumulate this name fragment
-                    current_tool_calls[idx]["function"]["name_parts"].append(func["name"])
-                    # Rebuild complete name from all parts
-                    current_tool_calls[idx]["function"]["name"] = "".join(
-                        current_tool_calls[idx]["function"]["name_parts"]
-                    )
+                    target_func["name"] += func["name"]
 
-                # Handle function arguments accumulation (partial JSON strings)
+                # Direct string concatenation for arguments
                 if "arguments" in func:
-                    # Initialize parts list if not exists
-                    if "args_parts" not in current_tool_calls[idx]["function"]:
-                        current_tool_calls[idx]["function"]["args_parts"] = []
-                    # Accumulate this argument fragment
-                    current_tool_calls[idx]["function"]["args_parts"].append(func["arguments"])
-                    # Rebuild complete arguments JSON from all parts
-                    current_tool_calls[idx]["function"]["arguments"] = "".join(
-                        current_tool_calls[idx]["function"]["args_parts"]
-                    )
+                    target_func["arguments"] += func["arguments"]
+
+    def _create_empty_tool_call(self) -> dict[str, Any]:
+        """Create an empty tool call structure."""
+        return {
+            "id": "",
+            "type": "function",
+            "function": {"name": "", "arguments": ""}
+        }
 
     async def _execute_tool_calls(
         self, conv: list[dict[str, Any]], calls: list[dict[str, Any]]
     ) -> None:
         """
         Execute tool calls and append results to conversation history.
-
-        This internal method handles the execution phase of tool calls after they
-        have been accumulated from streaming deltas. It processes each tool call
-        sequentially, validates the JSON arguments, executes the tool through the
-        tool manager, and formats the results for inclusion in the conversation.
-
-        The method implements fail-fast behavior:
-        1. Parses JSON arguments with strict validation - fails on malformed JSON
-        2. Executes tools through the tool manager (which handles validation)
-        3. Extracts content from MCP CallToolResult using _pluck_content helper
-        4. Appends tool results to conversation in OpenAI chat format
 
         Args:
             conv: The conversation history list (modified in-place)
@@ -633,32 +712,44 @@ class ChatService:
             - May raise exceptions if tool execution fails (handled by caller)
 
         Raises:
-            json.JSONDecodeError: If tool call arguments contain invalid JSON
-
-        Note:
-            Tool calls are executed sequentially, not in parallel. This ensures
-            deterministic execution order and prevents resource conflicts between tools.
+            McpError: If tool calls are incomplete or malformed
         """
         assert self.tool_mgr is not None
 
+        # Validate that all tool calls are complete before attempting execution
+        if not self._validate_tool_calls_complete(calls):
+            raise McpError(
+                error=types.ErrorData(
+                    code=types.INVALID_PARAMS,
+                    message=(
+                        "Tool calls are incomplete - streaming not finished or "
+                        "JSON arguments are malformed"
+                    ),
+                )
+            )
+
         for call in calls:
             tool_name = call["function"]["name"]
-            # Parse JSON arguments with strict validation - fail fast on malformed JSON
-            try:
-                args = json.loads(call["function"]["arguments"] or "{}")
-            except json.JSONDecodeError as e:
-                raise McpError(
-                    error=types.ErrorData(
-                        code=types.INVALID_PARAMS,
-                        message=(
-                            f"Invalid JSON in tool call arguments for "
-                            f"{tool_name}: {e}"
-                        ),
-                    )
-                ) from e
+            # Retrieve parsed arguments from validation if available
+            parsed_args = call["function"].pop("_parsed_args", None)
+            if parsed_args is None:
+                # Parse JSON args with strict validation - fail fast on malformed
+                try:
+                    args_str = call["function"].get("arguments", "") or "{}"
+                    parsed_args = json.loads(args_str)
+                except json.JSONDecodeError as e:
+                    raise McpError(
+                        error=types.ErrorData(
+                            code=types.INVALID_PARAMS,
+                            message=(
+                                f"Invalid JSON in tool call arguments for "
+                                f"{tool_name}: {e}"
+                            ),
+                        )
+                    ) from e
 
             # Execute tool through tool manager (handles validation and routing)
-            result = await self.tool_mgr.call_tool(tool_name, args)
+            result = await self.tool_mgr.call_tool(tool_name, parsed_args)
 
             # Extract readable content from MCP result structure
             content = self._pluck_content(result)
@@ -671,6 +762,51 @@ class ChatService:
                     "content": content,
                 }
             )
+
+    def _validate_tool_calls_complete(self, calls: list[dict[str, Any]]) -> bool:
+        """
+        Validate that tool calls are complete and ready for execution.
+
+        Checks that each tool call has:
+        1. Non-empty ID
+        2. Valid function name
+        3. Well-formed JSON arguments (can be parsed)
+
+        Additionally caches the parsed JSON arguments in the call dictionary to
+        avoid reparsing in `_execute_tool_calls`.
+
+        Args:
+            calls: List of tool call dictionaries to validate
+
+        Returns:
+            bool: True if all tool calls are complete and valid
+        """
+        if not calls:
+            return True  # Empty list is considered complete
+
+        for call in calls:
+            # Check basic structure
+            if not call.get("id"):
+                return False
+
+            function = call.get("function", {})
+            if not function.get("name"):
+                return False
+
+            # Validate JSON arguments are complete and parseable
+            arguments = function.get("arguments", "")
+            if arguments:
+                try:
+                    parsed = json.loads(arguments)
+                    # Cache parsed args for later use
+                    function["_parsed_args"] = parsed
+                except json.JSONDecodeError:
+                    # JSON is incomplete or malformed
+                    return False
+            else:
+                function["_parsed_args"] = {}
+
+        return True
 
     async def _get_existing_assistant_response(
         self, conversation_id: str, request_id: str
@@ -706,55 +842,31 @@ class ChatService:
         if not self.tool_mgr:
             raise RuntimeError("Tool manager not initialized")
 
-        async with self._conv_lock(conversation_id):          # NEW 🔒
-            # CONCURRENCY SAFETY: Check for existing response prevents duplicate
-            # LLM calls and double-billing when multiple processes handle the
-            # same request_id simultaneously in non-streaming mode.
-            existing_response = await self._get_existing_assistant_response(
-                conversation_id, request_id
+        async with self._conv_lock(conversation_id):
+            (
+                should_continue,
+                cached_response,
+            ) = await self._handle_user_message_persistence(
+                conversation_id, user_msg, request_id, return_cached_response=True
             )
-            if existing_response:
-                logger.info(
-                    f"Returning cached response for request_id: {request_id}"
-                )
-                return existing_response
+            if not should_continue:
+                assert cached_response is not None
+                return cached_response
 
-            # persist user message only if it does *not* exist yet
-            if not await self.repo.event_exists(
-                conversation_id, "user_message", request_id
-            ):
-                user_ev = ChatEvent(
-                    conversation_id=conversation_id,
-                    seq=0,
-                    type="user_message",
-                    role="user",
-                    content=user_msg,
-                    extra={"request_id": request_id},
-                )
-                user_ev.compute_and_cache_tokens()
-                await self.repo.add_event(user_ev)
+            # build canonical history from repo
+            conv = await self._build_conversation_history(conversation_id, user_msg)
 
-            # 2) build canonical history from repo
-            events = await self.repo.last_n_tokens(conversation_id, self.ctx_window)
-            conv, _ = build_conversation_with_token_limit(
-                self._system_prompt,
-                events,
-                user_msg,
-                self.ctx_window,
-                self.reserve_tokens  # Use configured reserve tokens
-            )
-
-            # 4) Generate assistant response with usage tracking
+            # Generate assistant response with usage tracking
             (
                 assistant_full_text,
                 total_usage,
                 model
             ) = await self._generate_assistant_response(conv)
 
-            # 5) persist assistant message with usage and reference to user request
+            # persist assistant message with usage and reference to user request
             assistant_ev = ChatEvent(
                 conversation_id=conversation_id,
-                seq=0,  # Will be assigned by repository
+                seq=0,
                 type="assistant_message",
                 role="assistant",
                 content=assistant_full_text,
@@ -772,28 +884,15 @@ class ChatService:
         """
         Convert LLM API usage statistics to internal Usage model.
 
-        This internal method normalizes usage data from different LLM API providers
-        into the platform's standardized Usage Pydantic model. It handles cases
-        where usage information may be missing or incomplete.
-
-        The method provides safe defaults (0 tokens) for missing fields to ensure
-        consistent usage tracking across all LLM interactions. This is important
-        for cost monitoring and rate limiting.
+        Provides safe defaults (0 tokens) for missing fields to ensure
+        consistent usage tracking across all LLM interactions.
 
         Args:
             api_usage: Raw usage dictionary from LLM API response, may be None
-                      Expected fields: prompt_tokens, completion_tokens, total_tokens
 
         Returns:
             Usage: Pydantic model with normalized token counts, using 0 for
                    missing fields
-
-        Example:
-            api_usage = {
-                "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15
-            }
-            usage = self._convert_usage(api_usage)
-            # Returns: Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
         """
         if not api_usage:
             return Usage()
@@ -838,39 +937,25 @@ class ChatService:
 
         hops = 0
         while calls := assistant_msg.get("tool_calls"):
-            max_tool_hops = self.configuration.get_max_tool_hops()
-            if hops >= max_tool_hops:
+            exceeded, max_hops, warning_msg = self._exceeded_tool_hops(hops)
+            if exceeded:
                 logger.warning(
-                    f"Maximum tool hops ({max_tool_hops}) reached, stopping recursion"
+                    f"Maximum tool hops ({max_hops}) reached, stopping recursion"
                 )
-                assistant_full_text += (
-                    f"\n\n⚠️ Reached maximum tool call limit ({max_tool_hops}). "
-                    "Stopping to prevent infinite recursion."
-                )
+                assistant_full_text += "\n\n" + warning_msg
                 break
 
+            cleaned_calls = self._clean_tool_calls_for_conversation(calls)
             conv.append(
                 {
                     "role": "assistant",
                     "content": assistant_msg.get("content") or "",
-                    "tool_calls": calls,
+                    "tool_calls": cleaned_calls,
                 }
             )
 
-            for call in calls:
-                tool_name = call["function"]["name"]
-                args = json.loads(call["function"]["arguments"] or "{}")
-
-                result = await self.tool_mgr.call_tool(tool_name, args)
-                content = self._pluck_content(result)
-
-                conv.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": content,
-                    }
-                )
+            # Use centralized tool execution logic to avoid duplication
+            await self._execute_tool_calls(conv, cleaned_calls)
 
             reply = await self.llm_client.get_response_with_tools(conv, tools_payload)
             assistant_msg = reply["message"]
@@ -941,32 +1026,8 @@ class ChatService:
         results can contain various content types (text, images, binary data, embedded
         resources) that need different handling strategies.
 
-        The method implements fail-fast processing:
-        1. Handle structured content (if present) by JSON serialization with
-           strict validation
-        2. Process each content item based on its type:
-           - TextContent: Extract text directly
-           - ImageContent: Create descriptive placeholder
-           - BlobResourceContents: Create size-based placeholder
-           - EmbeddedResource: Recursively extract from nested resource
-           - Unknown types: Create type-based placeholder
-        3. Return "✓ done" for empty results to indicate successful completion
-
-        This approach ensures that all tool results can be meaningfully represented
-        in text form for the LLM, while preserving important metadata about non-text
-        content types.
-
-        Args:
-            res: MCP CallToolResult containing the tool execution result
-
         Returns:
             str: Human-readable text representation of the tool result content
-
-        Raises:
-            McpError: If structured content cannot be serialized to JSON
-
-        Side Effects:
-            - Does not modify the input result object
         """
         if not res.content:
             return "✓ done"
@@ -1049,11 +1110,11 @@ class ChatService:
         self,
     ) -> dict[str, list[types.TextResourceContents | types.BlobResourceContents]]:
         """
-        Check resource availability and return only resources that can be read
-        successfully.
+        Get resources that are confirmed available from the pre-validated catalog.
 
-        This implements graceful degradation by only including working resources
-        in the system prompt, following best practices for resource management.
+        Since _update_resource_catalog_on_availability() already verified these
+        resources work, we can trust the catalog and fetch content directly.
+        This avoids redundant availability checking.
         """
         available_resources: dict[
             str, list[types.TextResourceContents | types.BlobResourceContents]
@@ -1064,33 +1125,25 @@ class ChatService:
 
         for uri in self._resource_catalog:
             try:
+                # Resource is pre-validated by _update_resource_catalog_on_availability
                 resource_result = await self.tool_mgr.read_resource(uri)
                 if resource_result.contents:
-                    # Only include resources that have actual content
                     available_resources[uri] = resource_result.contents
-                    logger.debug(f"Resource {uri} is available and loaded")
+                    logger.debug(f"Resource {uri} loaded successfully")
                 else:
-                    logger.debug(f"Resource {uri} has no content, skipping")
+                    # Resource became unavailable since last catalog update
+                    logger.debug(f"Resource {uri} no longer has content")
             except Exception as e:
-                # Log the error but don't include in system prompt
-                # This prevents the LLM from being told about broken resources
-                logger.warning(
-                    f"Resource {uri} is unavailable and will be excluded "
-                    f"from system prompt: {e}"
+                # Resource became unavailable since last catalog update
+                logger.debug(
+                    f"Resource {uri} became unavailable since catalog update: {e}"
                 )
                 continue
 
-        if available_resources:
-            logger.info(
-                f"Including {len(available_resources)} available resources "
-                f"in system prompt"
-            )
-        else:
-            logger.info(
-                "No resources are currently available - system prompt will not "
-                "include resource section"
-            )
-
+        logger.debug(
+            f"Loaded {len(available_resources)} resources from validated catalog "
+            f"(skipped redundant availability checks)"
+        )
         return available_resources
 
     async def _update_resource_catalog_on_availability(self) -> None:

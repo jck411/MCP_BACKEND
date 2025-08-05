@@ -425,29 +425,44 @@ class AsyncSqlRepo(ChatRepository):
 
         async def _add_events_operation(connection: aiosqlite.Connection) -> bool:
             try:
-                # Group events by conversation for sequence assignment
-                conv_events: dict[str, list[ChatEvent]] = {}
-                for event in events:
-                    conv_events.setdefault(event.conversation_id, []).append(event)
-
-                # Assign sequence numbers per conversation
-                for conv_id, conv_event_list in conv_events.items():
-                    # Get current max sequence for this conversation
+                # PERFORMANCE: Single query to get max sequences for all conversations
+                conv_ids = list({event.conversation_id for event in events})
+                if len(conv_ids) == 1:
+                    # Single conversation optimization
                     cursor = await connection.execute("""
                         SELECT COALESCE(MAX(seq), 0)
                         FROM chat_events
                         WHERE conversation_id = ?
-                    """, (conv_id,))
+                    """, (conv_ids[0],))
                     result = await cursor.fetchone()
                     await cursor.close()
-                    current_max = result[0] if result else 0
+                    conv_max_seqs = {conv_ids[0]: result[0] if result else 0}
+                else:
+                    # Multiple conversations - batch query
+                    placeholders = ",".join("?" * len(conv_ids))
+                    cursor = await connection.execute(f"""
+                        SELECT conversation_id, COALESCE(MAX(seq), 0) as max_seq
+                        FROM chat_events
+                        WHERE conversation_id IN ({placeholders})
+                        GROUP BY conversation_id
+                    """, conv_ids)
+                    results = await cursor.fetchall()
+                    await cursor.close()
+                    conv_max_seqs = {row[0]: row[1] for row in results}
+                    # Add missing conversations with seq 0
+                    for conv_id in conv_ids:
+                        if conv_id not in conv_max_seqs:
+                            conv_max_seqs[conv_id] = 0
 
-                    # Assign sequential numbers
-                    for i, event in enumerate(conv_event_list):
-                        if event.seq is None or event.seq == 0:
-                            event.seq = current_max + i + 1
+                # PERFORMANCE: Batch sequence assignment without O(n²) grouping
+                seq_counters = conv_max_seqs.copy()
+                for event in events:
+                    if event.seq is None or event.seq == 0:
+                        seq_counters[event.conversation_id] += 1
+                        event.seq = seq_counters[event.conversation_id]
 
-                # Insert all events
+                # PERFORMANCE: Bulk insert with executemany
+                insert_data = []
                 for event in events:
                     request_id = event.extra.get("request_id")
                     content_str = self._serialize_content(event.content)
@@ -457,14 +472,8 @@ class AsyncSqlRepo(ChatRepository):
                     usage_str = json.dumps(
                         event.usage.model_dump() if event.usage else None
                     )
-
-                    await connection.execute("""
-                        INSERT INTO chat_events (
-                            id, conversation_id, seq, timestamp, type, role,
-                            content, tool_calls, tool_call_id, model, usage,
-                            extra, token_count, request_id
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
+                    
+                    insert_data.append((
                         event.id,
                         event.conversation_id,
                         event.seq,
@@ -480,6 +489,15 @@ class AsyncSqlRepo(ChatRepository):
                         event.token_count,
                         request_id,
                     ))
+
+                # Single bulk insert operation
+                await connection.executemany("""
+                    INSERT INTO chat_events (
+                        id, conversation_id, seq, timestamp, type, role,
+                        content, tool_calls, tool_call_id, model, usage,
+                        extra, token_count, request_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, insert_data)
                 await connection.commit()
                 return True
             except aiosqlite.IntegrityError:

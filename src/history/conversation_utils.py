@@ -71,14 +71,27 @@ def build_conversation_with_token_limit(
 
     # Process events in chronological order to maintain conversation flow
     user_message_already_included = False
+    seen_user_messages = set()  # Track user message content to prevent duplicates
+
     for event in events:
         # Only include events that make sense in LLM conversation context
         if event.type in ("user_message", "assistant_message", "system_update"):
-            # Check if this is a user message with exact same content as current
-            if (event.type == "user_message" and
-                event.role == "user" and
-                event.content == user_message):
-                user_message_already_included = True
+            # For user messages, implement deduplication
+            if event.type == "user_message":
+                # Check if this is a duplicate user message
+                if event.content and event.content in seen_user_messages:
+                    content_str = str(event.content)
+                    content_preview = (content_str[:50] + "...")
+                    logger.debug(f"Skipping duplicate user message: {content_preview}")
+                    continue
+
+                # Track this user message content
+                if event.content:
+                    seen_user_messages.add(event.content)
+
+                # Check if this matches the current user message
+                if event.content == user_message:
+                    user_message_already_included = True
 
             # Get cached token count for this event
             event_tokens = event.compute_and_cache_tokens()

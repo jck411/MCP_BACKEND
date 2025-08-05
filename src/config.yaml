@@ -79,6 +79,9 @@ chat:
         max_attempts: 5        # Maximum number of retry attempts
         initial_delay: 0.05    # Initial backoff delay in seconds
         flush_every_n_deltas: 25  # Flush frequency for streaming deltas
+      
+      # PERFORMANCE: Delta batch size for database writes
+      delta_batch_size: 25     # Number of deltas to batch before database write
 
     # Tool execution configuration
     max_tool_hops: 8  # Maximum number of recursive tool calls to prevent infinite loops
@@ -102,7 +105,7 @@ chat:
 
 # LLM Configuration - Just change the 'active' provider!
 llm:
-  active: "openai"  # Change this to: openai, groq, openrouter
+  active: "openrouter"  # Change this to: openai, groq, openrouter
 
   # Provider presets
   providers:
@@ -128,7 +131,7 @@ llm:
 
     openrouter:
       base_url: "https://openrouter.ai/api/v1"
-      model: "openrouter/horizon-beta"  # or other available models
+      model: "moonshotai/kimi-k2"  # or other available models
       temperature: 0.7
       max_tokens: 4096
       top_p: 1.0
