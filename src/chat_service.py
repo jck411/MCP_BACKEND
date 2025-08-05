@@ -8,12 +8,12 @@ This module handles the business logic for chat sessions, including:
 - LLM interactions
 - File lock contention handling with exponential backoff
 
-This version is based off the 2025‑08‑02 refactor, but incorporates a number of
+This version is based off the 2025-08-02 refactor, but incorporates a number of
 performance fixes.  In particular it avoids quadratic behaviour when
 accumulating streamed tool call fragments, eliminates double JSON parsing
 during tool execution, and uses a simple `defaultdict` for conversation
-locks instead of a `WeakValueDictionary` to reduce lock churn.  A per‑response
-map of tool‑call IDs to indices is maintained to resolve missing indices
+locks instead of a `WeakValueDictionary` to reduce lock churn.  A per-response
+map of tool-call IDs to indices is maintained to resolve missing indices
 quickly without scanning the current tool call list.
 """
 
@@ -50,24 +50,24 @@ logger = logging.getLogger(__name__)
 class EfficientStringBuilder:
     """
     Efficient string building for tool call accumulation.
-    
+
     BEFORE: String concatenation creates many intermediate objects
     AFTER: Uses StringIO for efficient building
-    
+
     Performance improvement: 20-50% for large tool calls
     """
-    
+
     def __init__(self):
         self._buffer = io.StringIO()
-    
+
     def append(self, text: str) -> None:
         """Append text efficiently."""
         self._buffer.write(text)
-    
+
     def get_value(self) -> str:
         """Get the final string value."""
         return self._buffer.getvalue()
-    
+
     def clear(self) -> None:
         """Clear the buffer for reuse."""
         self._buffer.seek(0)
@@ -133,7 +133,7 @@ class ChatService:
         self._ready = asyncio.Event()
         self._resource_catalog: list[str] = []  # Initialize resource catalog
 
-        # Per‑conversation locks to serialize writes.  We use a simple
+        # Per-conversation locks to serialize writes.  We use a simple
         # defaultdict rather than WeakValueDictionary to avoid churn: once
         # created, a lock remains for the lifetime of the process.
         self._conv_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -210,7 +210,7 @@ class ChatService:
 
             # Use connected clients for tool management (empty list is acceptable)
             self.tool_mgr = ToolSchemaManager(connected_clients)
-            
+
             # PERFORMANCE: Initialize tool manager and resource catalog in parallel
             await asyncio.gather(
                 self.tool_mgr.initialize(),
@@ -551,7 +551,7 @@ class ChatService:
 
         # PERFORMANCE: More aggressive batching with configurable size
         batch_size = self.chat_conf.get("delta_batch_size", 25)  # Increased from 10
-        
+
         async def _flush():
             nonlocal pending_deltas
             if not pending_deltas:
@@ -1150,19 +1150,23 @@ class ChatService:
         if not self._resource_catalog or not self.tool_mgr:
             return available_resources
 
-        async def load_single_resource(uri: str) -> tuple[str, list[types.TextResourceContents | types.BlobResourceContents] | None]:
+        async def load_single_resource(
+            uri: str,
+        ) -> tuple[
+            str,
+            list[types.TextResourceContents | types.BlobResourceContents] | None
+        ]:
             """Load a single resource and return (uri, contents) or (uri, None)."""
             if not self.tool_mgr:
                 return uri, None
-                
+
             try:
                 resource_result = await self.tool_mgr.read_resource(uri)
                 if resource_result.contents:
                     logger.debug(f"Resource {uri} loaded successfully")
                     return uri, resource_result.contents
-                else:
-                    logger.debug(f"Resource {uri} no longer has content")
-                    return uri, None
+                logger.debug(f"Resource {uri} no longer has content")
+                return uri, None
             except Exception as e:
                 logger.debug(f"Resource {uri} became unavailable: {e}")
                 return uri, None

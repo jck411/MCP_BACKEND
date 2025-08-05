@@ -115,23 +115,26 @@ class PooledSqlRepo(ChatRepository):
                 CREATE INDEX IF NOT EXISTS idx_conversation_seq
                 ON chat_events(conversation_id, seq)
             """)
-            
+
             # Performance optimization indexes
             await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_assistant_messages_by_request 
-                ON chat_events(conversation_id, type, json_extract(extra, '$.user_request_id'))
+                CREATE INDEX IF NOT EXISTS idx_assistant_messages_by_request
+                ON chat_events(
+                    conversation_id, type,
+                    json_extract(extra, '$.user_request_id')
+                )
                 WHERE type = 'assistant_message'
             """)
             await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_events_by_conversation_timestamp 
+                CREATE INDEX IF NOT EXISTS idx_events_by_conversation_timestamp
                 ON chat_events(conversation_id, timestamp DESC, token_count)
             """)
             await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_conversation_seq_desc 
+                CREATE INDEX IF NOT EXISTS idx_conversation_seq_desc
                 ON chat_events(conversation_id, seq DESC)
             """)
             await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_conversation_type_seq 
+                CREATE INDEX IF NOT EXISTS idx_conversation_type_seq
                 ON chat_events(conversation_id, type, seq)
             """)
             await conn.commit()
@@ -378,21 +381,22 @@ class PooledSqlRepo(ChatRepository):
                 WITH running_totals AS (
                     SELECT *,
                            SUM(COALESCE(token_count, 0)) OVER (
-                               ORDER BY seq DESC 
+                               ORDER BY seq DESC
                                ROWS UNBOUNDED PRECEDING
                            ) as running_total
-                    FROM chat_events 
+                    FROM chat_events
                     WHERE conversation_id = ?
                     ORDER BY seq DESC
                 )
-                SELECT * FROM running_totals 
+                SELECT * FROM running_totals
                 WHERE running_total <= ?
                 ORDER BY seq ASC
             """, (conversation_id, max_tokens))
-            
+
             rows = await cursor.fetchall()
             await cursor.close()
-            return [self._row_to_event(row[:-1]) for row in rows]  # Exclude running_total column
+            # Exclude running_total column
+            return [self._row_to_event(row[:-1]) for row in rows]
 
     async def list_conversations(self) -> list[str]:
         """List all conversations using a reader connection."""
@@ -446,11 +450,11 @@ class PooledSqlRepo(ChatRepository):
 
         async with self.pool.acquire_reader() as conn:
             cursor = await conn.execute("""
-                SELECT id FROM chat_events 
-                WHERE conversation_id = ? 
-                AND type = 'assistant_message' 
+                SELECT id FROM chat_events
+                WHERE conversation_id = ?
+                AND type = 'assistant_message'
                 AND json_extract(extra, '$.user_request_id') = ?
-                ORDER BY seq DESC 
+                ORDER BY seq DESC
                 LIMIT 1
             """, (conversation_id, user_request_id))
             row = await cursor.fetchone()
