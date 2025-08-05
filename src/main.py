@@ -28,9 +28,8 @@ from src.history.repositories.pooled_sql_repo import PooledSqlRepo
 from src.history.repositories.sql_repo import AsyncSqlRepo
 from src.websocket_server import ServerConfig, run_websocket_server
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+# Configure logging
+logger = logging.getLogger(__name__)
 
 
 class MCPClient:
@@ -111,7 +110,7 @@ class MCPClient:
         self._reconnect_delay: float = self._initial_reconnect_delay
 
         # Log configuration for debugging
-        logging.info(
+        logger.info(
             f"MCP client '{name}' configured with: "
             f"max_attempts={self._max_reconnect_attempts}, "
             f"initial_delay={self._initial_reconnect_delay}s, "
@@ -303,7 +302,7 @@ class MCPClient:
             self.session.initialize(), timeout=self._connection_timeout
         )
 
-        logging.info(f"MCP client '{self.name}' connected successfully")
+        logger.info(f"MCP client '{self.name}' connected successfully")
 
     async def ping(self) -> bool:
         """Send ping to verify connection is alive."""
@@ -471,10 +470,10 @@ class MCPClient:
             )
 
         try:
-            logging.info(f"Calling tool '{name}' on client '{self.name}'")
+            logger.info(f"Calling tool '{name}' on client '{self.name}'")
 
             result = await self.session.call_tool(name, arguments)
-            logging.info(f"Tool '{name}' executed successfully")
+            logger.info(f"Tool '{name}' executed successfully")
             return result
         except McpError as e:
             logging.error(f"MCP error calling tool '{name}': {e.error.message}")
@@ -878,6 +877,43 @@ async def cleanup_mcp_clients(clients: list[MCPClient]) -> None:
 async def main() -> None:
     """Main entry point - WebSocket interface with graceful shutdown handling."""
     config = Configuration()
+
+    # Setup basic logging
+    logging_config = config.get_config_dict().get("logging", {})
+    log_level = logging_config.get("level", "INFO")
+
+    # Configure logging based on format preference
+    if logging_config.get("format", "console") == "json":
+        # Simple JSON logging for production
+        class JSONFormatter(logging.Formatter):
+            def format(self, record):
+                log_entry = {
+                    "timestamp": self.formatTime(record, self.datefmt),
+                    "level": record.levelname,
+                    "logger": record.name,
+                    "message": record.getMessage(),
+                    "module": record.module,
+                    "function": record.funcName,
+                    "line": record.lineno,
+                }
+                if record.exc_info:
+                    log_entry["exception"] = self.formatException(record.exc_info)
+                return json.dumps(log_entry)
+
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(JSONFormatter())
+        logging.basicConfig(
+            level=getattr(logging, log_level.upper()),
+            handlers=[handler],
+            force=True
+        )
+    else:
+        # Console logging for development
+        logging.basicConfig(
+            level=getattr(logging, log_level.upper()),
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            force=True
+        )
 
     # Setup MCP clients
     clients = setup_mcp_clients(config)

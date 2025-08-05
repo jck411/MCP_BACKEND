@@ -115,6 +115,25 @@ class PooledSqlRepo(ChatRepository):
                 CREATE INDEX IF NOT EXISTS idx_conversation_seq
                 ON chat_events(conversation_id, seq)
             """)
+            
+            # Performance optimization indexes
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_assistant_messages_by_request 
+                ON chat_events(conversation_id, type, json_extract(extra, '$.user_request_id'))
+                WHERE type = 'assistant_message'
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_events_by_conversation_timestamp 
+                ON chat_events(conversation_id, timestamp DESC, token_count)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_conversation_seq_desc 
+                ON chat_events(conversation_id, seq DESC)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_conversation_type_seq 
+                ON chat_events(conversation_id, type, seq)
+            """)
             await conn.commit()
 
         # Handle persistence settings
@@ -347,29 +366,33 @@ class PooledSqlRepo(ChatRepository):
     async def last_n_tokens(
         self, conversation_id: str, max_tokens: int
     ) -> list[ChatEvent]:
-        """Get recent events up to token limit using a reader connection."""
+        """Get recent events up to token limit using optimized SQL query."""
         await self._initialize()
 
         if not self.persistence_config["enabled"]:
             return []
 
         async with self.pool.acquire_reader() as conn:
-            cursor = await conn.execute(
-                "SELECT * FROM chat_events WHERE conversation_id = ? "
-                "ORDER BY seq DESC",
-                (conversation_id,)
-            )
-            events: list[ChatEvent] = []
-            total = 0
-            async for row in cursor:
-                event = self._row_to_event(row)
-                tokens = event.token_count or 0
-                if total + tokens > max_tokens:
-                    break
-                events.insert(0, event)
-                total += tokens
+            # Use optimized query with running totals to reduce data transfer
+            cursor = await conn.execute("""
+                WITH running_totals AS (
+                    SELECT *,
+                           SUM(COALESCE(token_count, 0)) OVER (
+                               ORDER BY seq DESC 
+                               ROWS UNBOUNDED PRECEDING
+                           ) as running_total
+                    FROM chat_events 
+                    WHERE conversation_id = ?
+                    ORDER BY seq DESC
+                )
+                SELECT * FROM running_totals 
+                WHERE running_total <= ?
+                ORDER BY seq ASC
+            """, (conversation_id, max_tokens))
+            
+            rows = await cursor.fetchall()
             await cursor.close()
-            return events
+            return [self._row_to_event(row[:-1]) for row in rows]  # Exclude running_total column
 
     async def list_conversations(self) -> list[str]:
         """List all conversations using a reader connection."""
@@ -418,22 +441,21 @@ class PooledSqlRepo(ChatRepository):
     async def get_last_assistant_reply_id(
         self, conversation_id: str, user_request_id: str
     ) -> str | None:
-        """Get last assistant reply ID using a reader connection."""
+        """Get last assistant reply ID using optimized direct SQL query."""
         await self._initialize()
 
         async with self.pool.acquire_reader() as conn:
             cursor = await conn.execute("""
-                SELECT id, extra FROM chat_events
-                WHERE conversation_id = ? AND type = 'assistant_message'
-                ORDER BY seq DESC
-            """, (conversation_id,))
-            async for row in cursor:
-                extra = json.loads(row[1] or "{}")
-                if extra.get("user_request_id") == user_request_id:
-                    await cursor.close()
-                    return row[0]
+                SELECT id FROM chat_events 
+                WHERE conversation_id = ? 
+                AND type = 'assistant_message' 
+                AND json_extract(extra, '$.user_request_id') = ?
+                ORDER BY seq DESC 
+                LIMIT 1
+            """, (conversation_id, user_request_id))
+            row = await cursor.fetchone()
             await cursor.close()
-            return None
+            return row[0] if row else None
 
     async def get_event_by_id(
         self, conversation_id: str, event_id: str

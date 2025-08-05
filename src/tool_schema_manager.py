@@ -8,6 +8,7 @@ and conversion between MCP and OpenAI formats using the official MCP SDK.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +20,35 @@ if TYPE_CHECKING:
     from src.main import MCPClient
 
 logger = logging.getLogger(__name__)
+
+
+class LRUCache:
+    """Simple LRU cache implementation for parsed JSON and schemas."""
+    
+    def __init__(self, max_size: int = 1000):
+        self.max_size = max_size
+        self.cache: dict[str, Any] = {}
+        self.access_order: list[str] = []
+    
+    def get(self, key: str) -> Any | None:
+        if key in self.cache:
+            # Move to end (most recently used)
+            self.access_order.remove(key)
+            self.access_order.append(key)
+            return self.cache[key]
+        return None
+    
+    def put(self, key: str, value: Any) -> None:
+        if key in self.cache:
+            # Update existing
+            self.access_order.remove(key)
+        elif len(self.cache) >= self.max_size:
+            # Remove least recently used
+            oldest = self.access_order.pop(0)
+            del self.cache[oldest]
+        
+        self.cache[key] = value
+        self.access_order.append(key)
 
 
 class ToolSchemaManager:
@@ -34,6 +64,10 @@ class ToolSchemaManager:
         self._resource_registry: dict[str, ResourceInfo] = {}
         self._openai_tools: list[dict[str, Any]] = []
         self._schema_cache: dict[str, type[BaseModel]] = {}
+        
+        # PERFORMANCE: LRU caches to reduce redundant processing
+        self._json_cache = LRUCache(max_size=1000)
+        self._schema_conversion_cache = LRUCache(max_size=100)
 
     async def initialize(self) -> None:
         """
@@ -341,6 +375,31 @@ class ToolSchemaManager:
         if json_type not in type_mapping:
             raise ValueError(f"Unsupported JSON schema type: {json_type}")
         return type_mapping[json_type]
+
+    def cached_json_parse(self, json_str: str) -> Any:
+        """Cache parsed JSON to avoid redundant parsing."""
+        cache_key = str(hash(json_str))
+        cached = self._json_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        
+        parsed = json.loads(json_str)
+        self._json_cache.put(cache_key, parsed)
+        return parsed
+
+    def cached_schema_conversion(self, tool: types.Tool) -> dict[str, Any]:
+        """Cache schema conversions to avoid redundant processing."""
+        # Create a consistent cache key using tool properties
+        cache_key = f"{tool.name}:{hash(tool.model_dump_json())}"
+        
+        cached = self._schema_conversion_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        
+        # Perform the actual conversion
+        converted = self._convert_to_openai_schema(tool)
+        self._schema_conversion_cache.put(cache_key, converted)
+        return converted
 
     async def validate_tool_parameters(
         self, tool_name: str, parameters: dict[str, Any]

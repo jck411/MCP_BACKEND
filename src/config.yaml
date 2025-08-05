@@ -17,28 +17,28 @@ chat:
     ping_interval: 20
     ping_timeout: 10
     
-    # Concurrency and performance configuration
+    # Concurrency and performance configuration (OPTIMIZED FOR HIGH LOAD)
     concurrency:
       # Maximum concurrent WebSocket connections
-      max_connections: 100
+      max_connections: 1000      # Increased from 100 for high concurrency
       
       # Connection queue settings
-      connection_queue_size: 500  # Pending connections before rejection
+      connection_queue_size: 1000  # Must be >= max_connections
       
       # Uvicorn server configuration
       uvicorn:
-        backlog: 2048  # Socket backlog for accepting connections
-        workers: 1     # Single worker for WebSocket state management
-        access_log: false  # Disable access log for performance
+        backlog: 1200             # Must be >= connection_queue_size
+        workers: 1               # Single worker for WebSocket state management
+        access_log: false        # Disable for performance
         
         # Keep-alive settings for WebSocket connections
-        keepalive_timeout: 5   # Seconds to keep idle connections
-        max_keepalive_requests: 1000  # Max requests per connection
+        keepalive_timeout: 120   # 2 minutes for better connection reuse
+        max_keepalive_requests: 10000  # High limit for persistent connections
         
-        # Server limits
+        # Server limits (optimized for performance)
         h11_max_incomplete_event_size: 16384  # Max incomplete HTTP event size
         h11_max_request_line_size: 8192       # Max HTTP request line size
-        h11_max_header_size: 32768            # Max HTTP header size
+        h11_max_header_size: 16384            # Optimized header size
 
   # Chat Service Configuration
   service:
@@ -52,19 +52,19 @@ chat:
       type: "sql"              # SQLite database storage
       path: "events.db"        # Database file path
       
-      # Connection pool configuration for high-concurrency SQLite access
+      # Connection pool configuration for high-concurrency SQLite access (OPTIMIZED)
       connection_pool:
         # Pool sizing - total connections = max_readers + max_writers
-        max_connections: 10      # Total connection pool size
-        max_readers: 8           # Reader connections (optimized for SELECT queries)
-        max_writers: 2           # Writer connections (optimized for INSERT/UPDATE/DELETE)
+        max_connections: 20          # Increased pool size for high concurrency
+        max_readers: 16              # Many readers for concurrent requests
+        max_writers: 4               # Multiple writers for write throughput
         
         # Connection management
-        connection_timeout: 30.0      # Timeout waiting for available connection
-        health_check_interval: 60.0   # Health check frequency (seconds)
+        connection_timeout: 30.0     # Balanced timeout for connection acquisition
+        health_check_interval: 30.0  # More frequent health checks for reliability
         
         # Performance tuning
-        enable_pooling: true     # Enable connection pooling (set false for single connection)
+        enable_pooling: true         # Enable connection pooling for performance
       
       # Persistent memory configuration
       persistence:
@@ -86,10 +86,10 @@ chat:
     # Context management configuration
     context:
       # Maximum context window size in tokens
-      max_tokens: 4000
+      max_tokens: 2000  # Reduced from 4000 for faster processing
       
       # Tokens to reserve for LLM response generation
-      reserve_tokens: 500
+      reserve_tokens: 300  # Reduced from 500
       
       # Conversation length thresholds for response estimation
       conversation_limits:
@@ -118,7 +118,7 @@ chat:
         flush_every_n_deltas: 25  # Flush frequency for streaming deltas
       
       # PERFORMANCE: Delta batch size for database writes
-      delta_batch_size: 25     # Number of deltas to batch before database write
+      delta_batch_size: 50     # Increased from 25 for fewer DB operations
 
     # Tool execution configuration
     max_tool_hops: 8  # Maximum number of recursive tool calls to prevent infinite loops
@@ -210,7 +210,7 @@ llm:
 
     openrouter:
       base_url: "https://openrouter.ai/api/v1"
-      model: "moonshotai/kimi-k2"  # or other available models
+      model: "google/gemini-2.5-flash"  # or other available models
       temperature: 0.7
       max_tokens: 4096
       top_p: 1.0
@@ -221,15 +221,15 @@ llm:
       # HTTP client connection pooling and concurrency limits
       http_client:
         # Connection pool limits for outbound HTTP requests
-        max_connections: 40      # Total connection pool size
-        max_keepalive: 15        # Connections to keep alive in pool
-        keepalive_expiry: 25.0   # Seconds before idle connections expire
+        max_connections: 20      # Reduced from 40 for lower overhead
+        max_keepalive: 8         # Reduced from 15
+        keepalive_expiry: 15.0   # Reduced from 25.0
         
         # Timeout configuration for HTTP requests
-        connect_timeout: 15.0    # Connection establishment timeout (higher for OpenRouter)
-        read_timeout: 120.0      # Response read timeout (higher for various providers)
-        write_timeout: 10.0      # Request write timeout
-        pool_timeout: 8.0        # Wait time for connection from pool
+        connect_timeout: 8.0     # Reduced from 15.0
+        read_timeout: 60.0       # Reduced from 120.0
+        write_timeout: 8.0       # Reduced from 10.0
+        pool_timeout: 3.0        # Reduced from 8.0
         
         # Rate limiting to prevent API overwhelming
         requests_per_minute: 2000    # Max requests per minute
@@ -244,7 +244,9 @@ llm:
 # Logging Configuration
 logging:
   level: "INFO"
-  format: "%(asctime)s - %(levelname)s - %(message)s"
+  format: "json"  # "json" for production, "console" for development
+  service_name: "mcp-platform"
+  service_version: "1.0.0"
 
 # MCP Server Configuration
 mcp:
