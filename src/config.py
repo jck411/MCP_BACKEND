@@ -122,6 +122,98 @@ class Configuration:
         """
         return self._config.get("chat", {}).get("websocket", {})
 
+    def get_websocket_concurrency_config(self) -> dict[str, Any]:
+        """Get WebSocket concurrency configuration from YAML.
+
+        Returns:
+            WebSocket concurrency configuration dictionary with validated values.
+
+        Raises:
+            ValueError: If required concurrency parameters are missing or invalid.
+        """
+        websocket_config = self.get_websocket_config()
+        concurrency_config = websocket_config.get("concurrency", {})
+
+        # Required configuration keys
+        required_keys = ["max_connections", "connection_queue_size", "uvicorn"]
+        for key in required_keys:
+            if key not in concurrency_config:
+                raise ValueError(
+                    f"websocket.concurrency.{key} must be explicitly configured "
+                    "in config.yaml under chat.websocket.concurrency"
+                )
+
+        # Validate uvicorn sub-configuration
+        uvicorn_config = concurrency_config["uvicorn"]
+        uvicorn_required = [
+            "backlog", "workers", "access_log", "keepalive_timeout",
+            "max_keepalive_requests", "h11_max_incomplete_event_size",
+            "h11_max_request_line_size", "h11_max_header_size"
+        ]
+        for key in uvicorn_required:
+            if key not in uvicorn_config:
+                raise ValueError(
+                    f"websocket.concurrency.uvicorn.{key} must be explicitly "
+                    "configured in config.yaml"
+                )
+
+        # Validate configuration values
+        max_connections = concurrency_config["max_connections"]
+        queue_size = concurrency_config["connection_queue_size"]
+        backlog = uvicorn_config["backlog"]
+
+        if max_connections < 1:
+            raise ValueError("max_connections must be at least 1")
+        if queue_size < max_connections:
+            raise ValueError("connection_queue_size must be >= max_connections")
+        if backlog < queue_size:
+            raise ValueError("uvicorn.backlog must be >= connection_queue_size")
+
+        return concurrency_config
+
+    def get_http_client_config(self) -> dict[str, Any]:
+        """Get HTTP client configuration for the active LLM provider.
+
+        Returns:
+            HTTP client configuration dictionary with validated values.
+
+        Raises:
+            ValueError: If required HTTP client parameters are missing or invalid.
+        """
+        llm_config = self.get_llm_config()
+        http_config = llm_config.get("http_client", {})
+
+        # Required configuration keys
+        required_keys = [
+            "max_connections", "max_keepalive", "keepalive_expiry",
+            "connect_timeout", "read_timeout", "write_timeout", "pool_timeout",
+            "requests_per_minute", "concurrent_requests", "max_retries",
+            "backoff_factor"
+        ]
+
+        for key in required_keys:
+            if key not in http_config:
+                raise ValueError(
+                    f"http_client.{key} must be explicitly configured "
+                    f"for provider '{self._config['llm']['active']}' in config.yaml"
+                )
+
+        # Validate configuration values
+        max_conn = http_config["max_connections"]
+        max_keepalive = http_config["max_keepalive"]
+        concurrent_reqs = http_config["concurrent_requests"]
+
+        if max_conn < 1:
+            raise ValueError("http_client.max_connections must be at least 1")
+        if max_keepalive > max_conn:
+            raise ValueError("http_client.max_keepalive must be <= max_connections")
+        if concurrent_reqs > max_conn:
+            raise ValueError(
+                "http_client.concurrent_requests must be <= max_connections"
+            )
+
+        return http_config
+
     def get_logging_config(self) -> dict[str, Any]:
         """Get logging configuration from YAML.
 
@@ -435,7 +527,7 @@ class Configuration:
         """Get repository configuration from YAML.
 
         Returns:
-            Repository configuration dictionary with persistence settings.
+            Repository configuration dictionary with persistence and pool settings.
 
         Raises:
             ValueError: If required repository parameters are missing.
@@ -479,5 +571,48 @@ class Configuration:
                 "repository.persistence.retention_policy must be one of: "
                 f"{valid_policies}"
             )
+
+        # Validate connection pool configuration if present
+        if "connection_pool" in result_config:
+            pool_config = result_config["connection_pool"]
+
+            # Validate pool configuration
+            if pool_config.get("enable_pooling", True):
+                required_pool_keys = [
+                    "max_connections",
+                    "max_readers",
+                    "max_writers",
+                    "connection_timeout",
+                    "health_check_interval"
+                ]
+
+                for key in required_pool_keys:
+                    if key not in pool_config:
+                        raise ValueError(
+                            f"repository.connection_pool.{key} must be explicitly "
+                            "configured when enable_pooling is true"
+                        )
+
+                # Validate pool sizing constraints
+                max_readers = pool_config["max_readers"]
+                max_writers = pool_config["max_writers"]
+                max_connections = pool_config["max_connections"]
+
+                if max_readers + max_writers > max_connections:
+                    raise ValueError(
+                        f"connection_pool: max_readers ({max_readers}) + "
+                        f"max_writers ({max_writers}) cannot exceed "
+                        f"max_connections ({max_connections})"
+                    )
+
+                if max_readers < 1:
+                    raise ValueError(
+                        "connection_pool.max_readers must be at least 1"
+                    )
+
+                if max_writers < 1:
+                    raise ValueError(
+                        "connection_pool.max_writers must be at least 1"
+                    )
 
         return result_config

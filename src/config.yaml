@@ -16,6 +16,29 @@ chat:
     max_message_size: 16777216  # 16MB
     ping_interval: 20
     ping_timeout: 10
+    
+    # Concurrency and performance configuration
+    concurrency:
+      # Maximum concurrent WebSocket connections
+      max_connections: 100
+      
+      # Connection queue settings
+      connection_queue_size: 500  # Pending connections before rejection
+      
+      # Uvicorn server configuration
+      uvicorn:
+        backlog: 2048  # Socket backlog for accepting connections
+        workers: 1     # Single worker for WebSocket state management
+        access_log: false  # Disable access log for performance
+        
+        # Keep-alive settings for WebSocket connections
+        keepalive_timeout: 5   # Seconds to keep idle connections
+        max_keepalive_requests: 1000  # Max requests per connection
+        
+        # Server limits
+        h11_max_incomplete_event_size: 16384  # Max incomplete HTTP event size
+        h11_max_request_line_size: 8192       # Max HTTP request line size
+        h11_max_header_size: 32768            # Max HTTP header size
 
   # Chat Service Configuration
   service:
@@ -28,6 +51,20 @@ chat:
     repository:
       type: "sql"              # SQLite database storage
       path: "events.db"        # Database file path
+      
+      # Connection pool configuration for high-concurrency SQLite access
+      connection_pool:
+        # Pool sizing - total connections = max_readers + max_writers
+        max_connections: 10      # Total connection pool size
+        max_readers: 8           # Reader connections (optimized for SELECT queries)
+        max_writers: 2           # Writer connections (optimized for INSERT/UPDATE/DELETE)
+        
+        # Connection management
+        connection_timeout: 30.0      # Timeout waiting for available connection
+        health_check_interval: 60.0   # Health check frequency (seconds)
+        
+        # Performance tuning
+        enable_pooling: true     # Enable connection pooling (set false for single connection)
       
       # Persistent memory configuration
       persistence:
@@ -105,7 +142,7 @@ chat:
 
 # LLM Configuration - Just change the 'active' provider!
 llm:
-  active: "openrouter"  # Change this to: openai, groq, openrouter
+  active: "openai"  # Change this to: openai, groq, openrouter
 
   # Provider presets
   providers:
@@ -118,6 +155,27 @@ llm:
       
       # Response parsing defaults
       choice_index: 0  # Default choice index for response parsing
+      
+      # HTTP client connection pooling and concurrency limits
+      http_client:
+        # Connection pool limits for outbound HTTP requests
+        max_connections: 50      # Total connection pool size
+        max_keepalive: 20        # Connections to keep alive in pool
+        keepalive_expiry: 30.0   # Seconds before idle connections expire
+        
+        # Timeout configuration for HTTP requests
+        connect_timeout: 10.0    # Connection establishment timeout
+        read_timeout: 60.0       # Response read timeout
+        write_timeout: 10.0      # Request write timeout
+        pool_timeout: 5.0        # Wait time for connection from pool
+        
+        # Rate limiting to prevent API overwhelming
+        requests_per_minute: 3500    # Max requests per minute
+        concurrent_requests: 25      # Max concurrent requests
+        
+        # Retry configuration for failed requests
+        max_retries: 3               # Max retry attempts
+        backoff_factor: 0.5          # Exponential backoff multiplier
 
     groq:
       base_url: "https://api.groq.com/openai/v1"
@@ -128,6 +186,27 @@ llm:
       
       # Response parsing defaults
       choice_index: 0  # Default choice index for response parsing
+      
+      # HTTP client connection pooling and concurrency limits
+      http_client:
+        # Connection pool limits for outbound HTTP requests
+        max_connections: 30      # Total connection pool size (lower for Groq)
+        max_keepalive: 10        # Connections to keep alive in pool
+        keepalive_expiry: 20.0   # Seconds before idle connections expire
+        
+        # Timeout configuration for HTTP requests
+        connect_timeout: 10.0    # Connection establishment timeout
+        read_timeout: 90.0       # Response read timeout (higher for Groq)
+        write_timeout: 10.0      # Request write timeout
+        pool_timeout: 5.0        # Wait time for connection from pool
+        
+        # Rate limiting to prevent API overwhelming (Groq specific limits)
+        requests_per_minute: 600     # Max requests per minute (Groq limit)
+        concurrent_requests: 15      # Max concurrent requests
+        
+        # Retry configuration for failed requests
+        max_retries: 3               # Max retry attempts
+        backoff_factor: 1.0          # Exponential backoff multiplier
 
     openrouter:
       base_url: "https://openrouter.ai/api/v1"
@@ -138,6 +217,27 @@ llm:
       
       # Response parsing defaults
       choice_index: 0  # Default choice index for response parsing
+      
+      # HTTP client connection pooling and concurrency limits
+      http_client:
+        # Connection pool limits for outbound HTTP requests
+        max_connections: 40      # Total connection pool size
+        max_keepalive: 15        # Connections to keep alive in pool
+        keepalive_expiry: 25.0   # Seconds before idle connections expire
+        
+        # Timeout configuration for HTTP requests
+        connect_timeout: 15.0    # Connection establishment timeout (higher for OpenRouter)
+        read_timeout: 120.0      # Response read timeout (higher for various providers)
+        write_timeout: 10.0      # Request write timeout
+        pool_timeout: 8.0        # Wait time for connection from pool
+        
+        # Rate limiting to prevent API overwhelming
+        requests_per_minute: 2000    # Max requests per minute
+        concurrent_requests: 20      # Max concurrent requests
+        
+        # Retry configuration for failed requests
+        max_retries: 3               # Max retry attempts
+        backoff_factor: 0.8          # Exponential backoff multiplier
 
 
 

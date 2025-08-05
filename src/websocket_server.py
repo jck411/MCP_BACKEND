@@ -98,6 +98,25 @@ class WebSocketServer:
         # Store conversation id per socket
         self.conversation_ids: dict[WebSocket, str] = {}
 
+        # Get concurrency configuration for connection limits
+        try:
+            concurrency_config = configuration.get_websocket_concurrency_config()
+            self.max_connections = concurrency_config["max_connections"]
+            self.connection_queue_size = concurrency_config["connection_queue_size"]
+            self.uvicorn_config = concurrency_config["uvicorn"]
+
+            logger.info(
+                f"WebSocket server configured with "
+                f"max_connections={self.max_connections}, "
+                f"queue_size={self.connection_queue_size}, "
+                f"uvicorn_backlog={self.uvicorn_config['backlog']}"
+            )
+        except Exception as e:
+            # Fail fast if concurrency configuration is missing
+            raise ValueError(
+                f"Failed to load WebSocket concurrency configuration: {e}"
+            ) from e
+
     def _create_app(self) -> FastAPI:
         """Create and configure FastAPI app."""
         app = FastAPI(title="MCP WebSocket Chat Server")
@@ -384,19 +403,35 @@ class WebSocketServer:
             )
 
     async def _connect_websocket(self, websocket: WebSocket):
-        """Connect a WebSocket."""
+        """Connect a WebSocket with concurrency limits."""
         try:
+            # Check connection limits before accepting
+            if len(self.active_connections) >= self.max_connections:
+                logger.warning(
+                    f"WebSocket connection rejected: at max capacity "
+                    f"({len(self.active_connections)}/{self.max_connections})"
+                )
+                await websocket.close(
+                    code=1013,  # Try again later
+                    reason="Server at maximum capacity"
+                )
+                return
+
             logger.info(f"WebSocket connection attempt from {websocket.client}")
             await websocket.accept()
             self.active_connections.append(websocket)
             # Initialize conversation id for this connection
             self.conversation_ids[websocket] = str(uuid.uuid4())
             logger.info(
-                f"WebSocket connection established. Total connections: "
-                f"{len(self.active_connections)}"
+                f"WebSocket connection established. "
+                f"Active connections: {len(self.active_connections)}/"
+                f"{self.max_connections}"
             )
         except Exception as e:
             logger.error(f"Failed to accept WebSocket connection: {e}")
+            # Try to close the connection gracefully
+            with contextlib.suppress(Exception):
+                await websocket.close(code=1011, reason="Server error")
             raise
 
     def _disconnect_websocket(self, websocket: WebSocket):
@@ -456,10 +491,31 @@ class WebSocketServer:
         return host, port
 
     def _create_uvicorn_server(self, host: str, port: int) -> uvicorn.Server:
-        """Create and configure the uvicorn server instance."""
+        """Create and configure the uvicorn server instance with concurrency limits."""
         server_config = uvicorn.Config(
-            self.app, host=host, port=port, log_level="info"
+            self.app,
+            host=host,
+            port=port,
+            log_level="info",
+            # Concurrency and performance settings
+            backlog=self.uvicorn_config["backlog"],
+            workers=self.uvicorn_config["workers"],
+            access_log=self.uvicorn_config["access_log"],
+            # Connection settings
+            timeout_keep_alive=self.uvicorn_config["keepalive_timeout"],
+            limit_max_requests=self.uvicorn_config["max_keepalive_requests"],
+            # HTTP settings to prevent resource exhaustion
+            h11_max_incomplete_event_size=self.uvicorn_config[
+                "h11_max_incomplete_event_size"
+            ],
         )
+
+        logger.info(
+            f"Uvicorn server configured with backlog={self.uvicorn_config['backlog']}, "
+            f"workers={self.uvicorn_config['workers']}, "
+            f"keepalive_timeout={self.uvicorn_config['keepalive_timeout']}s"
+        )
+
         return uvicorn.Server(server_config)
 
     async def _run_server_with_monitoring(

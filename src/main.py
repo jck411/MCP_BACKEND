@@ -24,6 +24,7 @@ from pydantic import AnyUrl
 import src.chat_service
 from src.chat_service import ChatService
 from src.config import Configuration
+from src.history.repositories.pooled_sql_repo import PooledSqlRepo
 from src.history.repositories.sql_repo import AsyncSqlRepo
 from src.websocket_server import ServerConfig, run_websocket_server
 
@@ -541,7 +542,12 @@ class MCPClient:
 class LLMClient:
     """HTTP client for LLM API requests with structured tool call support."""
 
-    def __init__(self, config: dict[str, Any], api_key: str) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        api_key: str,
+        configuration: Configuration,
+    ) -> None:
         # Validate required configuration parameters
         required_keys = ["base_url", "model", "temperature", "max_tokens", "top_p"]
         for key in required_keys:
@@ -554,13 +560,50 @@ class LLMClient:
         self.config: dict[str, Any] = config
         self.api_key: str = api_key
 
+        # Get HTTP client configuration for connection pooling and limits
+        try:
+            http_config = configuration.get_http_client_config()
+            self.http_config = http_config
+
+            logging.info(
+                f"LLM HTTP client configured with "
+                f"max_connections={http_config['max_connections']}, "
+                f"concurrent_requests={http_config['concurrent_requests']}, "
+                f"pool_timeout={http_config['pool_timeout']}s"
+            )
+        except Exception as e:
+            # Fail fast if HTTP client configuration is missing
+            raise ValueError(
+                f"Failed to load HTTP client configuration: {e}"
+            ) from e
+
         # Get provider-specific headers for optimal API performance
         headers = self._get_provider_headers(api_key, config["base_url"])
+
+        # Configure connection limits and timeouts
+        limits = httpx.Limits(
+            max_connections=http_config["max_connections"],
+            max_keepalive_connections=http_config["max_keepalive"],
+            keepalive_expiry=http_config["keepalive_expiry"],
+        )
+
+        timeout = httpx.Timeout(
+            connect=http_config["connect_timeout"],
+            read=http_config["read_timeout"],
+            write=http_config["write_timeout"],
+            pool=http_config["pool_timeout"],
+        )
 
         self.client: httpx.AsyncClient = httpx.AsyncClient(
             base_url=config["base_url"],
             headers=headers,
-            timeout=30.0,
+            limits=limits,
+            timeout=timeout,
+        )
+
+        # Initialize semaphore for concurrent request limiting
+        self._request_semaphore = asyncio.Semaphore(
+            http_config["concurrent_requests"]
         )
 
     def _get_provider_headers(self, api_key: str, base_url: str) -> dict[str, str]:
@@ -586,157 +629,159 @@ class LLMClient:
     async def get_response_with_tools(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
     ) -> dict[str, Any]:
-        """Get response from LLM API with structured tool calls support."""
-        try:
-            payload = {
-                "model": self.config["model"],
-                "messages": messages,
-                "temperature": self.config["temperature"],
-                "max_tokens": self.config["max_tokens"],
-                "top_p": self.config["top_p"],
-            }
+        """Get response from LLM API with tools and concurrency limiting."""
+        async with self._request_semaphore:
+            try:
+                payload = {
+                    "model": self.config["model"],
+                    "messages": messages,
+                    "temperature": self.config["temperature"],
+                    "max_tokens": self.config["max_tokens"],
+                    "top_p": self.config["top_p"],
+                }
 
-            if tools:
-                payload["tools"] = tools
+                if tools:
+                    payload["tools"] = tools
 
-            response = await self.client.post("/chat/completions", json=payload)
-            response.raise_for_status()
-            result = response.json()
+                response = await self.client.post("/chat/completions", json=payload)
+                response.raise_for_status()
+                result = response.json()
 
-            choice = result["choices"][0]
-            # Validate choice index parameter from config
-            choice_index = self.config.get("choice_index")
-            if choice_index is None:
-                raise ValueError(
-                    "choice_index must be explicitly configured in LLM config"
-                )
+                choice = result["choices"][0]
+                # Validate choice index parameter from config
+                choice_index = self.config.get("choice_index")
+                if choice_index is None:
+                    raise ValueError(
+                        "choice_index must be explicitly configured in LLM config"
+                    )
 
-            return {
-                "message": choice["message"],
-                "finish_reason": choice.get("finish_reason"),
-                "index": choice.get("index", choice_index),
-                "usage": result.get("usage"),
-                "model": result.get("model", self.config["model"]),
-            }
-        except httpx.HTTPError as e:
-            logging.error(f"HTTP error: {e}")
-            raise McpError(
-                error=types.ErrorData(
-                    code=types.INTERNAL_ERROR, message=f"HTTP error: {e!s}"
-                )
-            ) from e
-        except KeyError as e:
-            logging.error(f"Unexpected response format: {e}")
-            raise McpError(
-                error=types.ErrorData(
-                    code=types.PARSE_ERROR,
-                    message=f"Unexpected response format: {e!s}",
-                )
-            ) from e
-        except Exception as e:
-            logging.error(f"LLM API error: {e}")
-            raise McpError(
-                error=types.ErrorData(
-                    code=types.INTERNAL_ERROR,
-                    message=f"LLM API error: {e!s}",
-                )
-            ) from e
+                return {
+                    "message": choice["message"],
+                    "finish_reason": choice.get("finish_reason"),
+                    "index": choice.get("index", choice_index),
+                    "usage": result.get("usage"),
+                    "model": result.get("model", self.config["model"]),
+                }
+            except httpx.HTTPError as e:
+                logging.error(f"HTTP error: {e}")
+                raise McpError(
+                    error=types.ErrorData(
+                        code=types.INTERNAL_ERROR, message=f"HTTP error: {e!s}"
+                    )
+                ) from e
+            except KeyError as e:
+                logging.error(f"Unexpected response format: {e}")
+                raise McpError(
+                    error=types.ErrorData(
+                        code=types.PARSE_ERROR,
+                        message=f"Unexpected response format: {e!s}",
+                    )
+                ) from e
+            except Exception as e:
+                logging.error(f"LLM API error: {e}")
+                raise McpError(
+                    error=types.ErrorData(
+                        code=types.INTERNAL_ERROR,
+                        message=f"LLM API error: {e!s}",
+                    )
+                ) from e
 
     async def get_streaming_response_with_tools(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
     ) -> AsyncGenerator[dict[str, Any]]:
-        """Get streaming response from LLM API with structured tool calls support."""
-        try:
-            payload = {
-                "model": self.config["model"],
-                "messages": messages,
-                "temperature": self.config["temperature"],
-                "max_tokens": self.config["max_tokens"],
-                "top_p": self.config["top_p"],
-                "stream": True,
-            }
+        """Get streaming response from LLM API with tools and concurrency limiting."""
+        async with self._request_semaphore:
+            try:
+                payload = {
+                    "model": self.config["model"],
+                    "messages": messages,
+                    "temperature": self.config["temperature"],
+                    "max_tokens": self.config["max_tokens"],
+                    "top_p": self.config["top_p"],
+                    "stream": True,
+                }
 
-            if tools:
-                payload["tools"] = tools
+                if tools:
+                    payload["tools"] = tools
 
-            async with self.client.stream(
-                "POST", "/chat/completions", json=payload
-            ) as response:
-                # FAIL FAST: Ensure streaming response is valid
-                HTTP_OK = 200
-                if response.status_code != HTTP_OK:
-                    error_text = await response.aread()
-                    raise McpError(
-                        error=types.ErrorData(
-                            code=types.INTERNAL_ERROR,
-                            message=(
-                                f"Streaming API error {response.status_code}: "
-                                f"{error_text}"
-                            ),
+                async with self.client.stream(
+                    "POST", "/chat/completions", json=payload
+                ) as response:
+                    # FAIL FAST: Ensure streaming response is valid
+                    HTTP_OK = 200
+                    if response.status_code != HTTP_OK:
+                        error_text = await response.aread()
+                        raise McpError(
+                            error=types.ErrorData(
+                                code=types.INTERNAL_ERROR,
+                                message=(
+                                    f"Streaming API error {response.status_code}: "
+                                    f"{error_text}"
+                                ),
+                            )
                         )
-                    )
 
-                content_type = response.headers.get("content-type", "")
-                expected_types = ["text/event-stream", "stream"]
-                if not any(t in content_type for t in expected_types):
-                    raise McpError(
-                        error=types.ErrorData(
-                            code=types.INTERNAL_ERROR,
-                            message=(
-                                f"Expected streaming response, got "
-                                f"content-type: {content_type}"
-                            ),
+                    content_type = response.headers.get("content-type", "")
+                    expected_types = ["text/event-stream", "stream"]
+                    if not any(t in content_type for t in expected_types):
+                        raise McpError(
+                            error=types.ErrorData(
+                                code=types.INTERNAL_ERROR,
+                                message=(
+                                    f"Expected streaming response, got "
+                                    f"content-type: {content_type}"
+                                ),
+                            )
                         )
-                    )
 
-                chunk_count = 0
-                async for line in response.aiter_lines():
-                    if not line.strip():
-                        continue
+                    chunk_count = 0
+                    async for line in response.aiter_lines():
+                        if not line.strip():
+                            continue
 
-                    if line.startswith("data: "):
-                        data = line[6:]  # Remove "data: " prefix
+                        if line.startswith("data: "):
+                            data = line[6:]  # Remove "data: " prefix
 
-                        if data.strip() == "[DONE]":
-                            break
+                            if data.strip() == "[DONE]":
+                                break
 
-                        try:
-                            chunk = json.loads(data)
-                            chunk_count += 1
-                            yield chunk
-                        except json.JSONDecodeError as e:
-                            # FAIL FAST: Invalid JSON in stream
-                            raise McpError(
-                                error=types.ErrorData(
-                                    code=types.PARSE_ERROR,
-                                    message=f"Invalid JSON in stream chunk: {e}",
-                                )
-                            ) from e
+                            try:
+                                chunk = json.loads(data)
+                                chunk_count += 1
+                                yield chunk
+                            except json.JSONDecodeError as e:
+                                # FAIL FAST: Invalid JSON in stream
+                                raise McpError(
+                                    error=types.ErrorData(
+                                        code=types.PARSE_ERROR,
+                                        message=f"Invalid JSON in stream chunk: {e}",
+                                    )
+                                ) from e
 
-                # FAIL FAST: Ensure we got at least some data
-                if chunk_count == 0:
-                    raise McpError(
-                        error=types.ErrorData(
-                            code=types.INTERNAL_ERROR,
-                            message="No streaming chunks received from API",
+                    # FAIL FAST: Ensure we got at least some data
+                    if chunk_count == 0:
+                        raise McpError(
+                            error=types.ErrorData(
+                                code=types.INTERNAL_ERROR,
+                                message="No streaming chunks received from API",
+                            )
                         )
-                    )
 
-        except httpx.HTTPError as e:
-            logging.error(f"HTTP error during streaming: {e}")
-            raise McpError(
-                error=types.ErrorData(
-                    code=types.INTERNAL_ERROR, message=f"HTTP error: {e!s}"
-                )
-            ) from e
-        except Exception as e:
-            logging.error(f"LLM streaming API error: {e}")
-            raise McpError(
-                error=types.ErrorData(
-                    code=types.INTERNAL_ERROR,
-                    message=f"LLM streaming API error: {e!s}",
-                )
-            ) from e
+            except httpx.HTTPError as e:
+                logging.error(f"HTTP error during streaming: {e}")
+                raise McpError(
+                    error=types.ErrorData(
+                        code=types.INTERNAL_ERROR, message=f"HTTP error: {e!s}"
+                    )
+                ) from e
+            except Exception as e:
+                logging.error(f"LLM streaming API error: {e}")
+                raise McpError(
+                    error=types.ErrorData(
+                        code=types.INTERNAL_ERROR,
+                        message=f"LLM streaming API error: {e!s}",
+                    )
+                ) from e
 
     async def close(self) -> None:
         """Close the HTTP client."""
@@ -751,13 +796,36 @@ class LLMClient:
         await self.close()
 
 
-def create_repository(config: Configuration) -> AsyncSqlRepo:
+def create_repository(config: Configuration) -> AsyncSqlRepo | PooledSqlRepo:
     """Create repository instance based on configuration."""
     repo_config = config.get_repository_config()
     db_path = repo_config.get("path", "events.db")
     persistence_config = repo_config.get("persistence", {})
 
-    logging.info(f"Using AsyncSqlRepo with database path: {db_path}")
+    # Check if connection pooling is enabled
+    pool_config = repo_config.get("connection_pool", {})
+    enable_pooling = pool_config.get("enable_pooling", True)
+
+    if enable_pooling:
+        # Use the new pooled repository for better concurrency
+        logging.info(
+            f"Using PooledSqlRepo with database path: {db_path} "
+            f"(pooling: {pool_config['max_readers']} readers, "
+            f"{pool_config['max_writers']} writers)"
+        )
+        logging.info(
+            f"Persistence enabled: {persistence_config.get('enabled', True)}"
+        )
+        return PooledSqlRepo(
+            db_path=db_path,
+            persistence_config=persistence_config,
+            pool_config=pool_config
+        )
+
+    # Use the legacy single-connection repository
+    logging.info(
+        f"Using AsyncSqlRepo (single connection) with database path: {db_path}"
+    )
     logging.info(f"Persistence enabled: {persistence_config.get('enabled', True)}")
     return AsyncSqlRepo(db_path, persistence_config)
 
@@ -840,7 +908,7 @@ async def main() -> None:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, signal_handler)
 
-    async with LLMClient(llm_config, api_key) as llm_client:
+    async with LLMClient(llm_config, api_key, config) as llm_client:
         try:
             # Run server with shutdown handling
             server_config = ServerConfig(
@@ -882,5 +950,12 @@ async def main() -> None:
             # (ChatService should have already closed them, but this ensures cleanup)
             await cleanup_mcp_clients(clients)
             logging.info("Application shutdown complete")
-if __name__ == "__main__":
+
+
+def cli_main() -> None:
+    """Synchronous entry point for console script."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    cli_main()
